@@ -1,11 +1,17 @@
 #include <linux/vfio.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h> 
+#include <sys/mman.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
+#include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdint.h>
+#include "desc_queue.h"
+#include "mmio_api.h"
 
 #define NUM_DEVICES                 3
 #define NUM_BARS                    3
@@ -15,9 +21,10 @@
 
 #define OCTNET_TX_DESCQ_OFFSET      0x2000400
 #define OCTNET_RX_DESCQ_OFFSET      0x2010000
-#define TX_DESCQ_OFFSET(mdev)       (mdev->bar_map[BAR4] + OCTNET_TX_DESCQ_OFFSET)
-#define RX_DESCQ_OFFSET(mdev)       (mdev->bar_map[BAR4] + OCTNET_RX_DESCQ_OFFSET)
-
+#define TX_DESCQ_OFFSET(mdev)       ((uint8_t*)mdev->bar_map[BAR4].bar_addr + OCTNET_TX_DESCQ_OFFSET)
+#define RX_DESCQ_OFFSET(mdev)       ((uint8_t*)mdev->bar_map[BAR4].bar_addr + OCTNET_RX_DESCQ_OFFSET)
+#define OCTBOOT_NET_DESCQ_CLEAN 0
+#define OCTBOOT_NET_DESCQ_READY 1
 
 #define DPI_MAX_PTR_1500_MTU 15
 #define DPI_MAX_PTR_9600_MTU 4
@@ -37,22 +44,65 @@
 
 #define OCTBOOT_NET_NUM_ELEMENTS 256
 
+struct user_queue_lock {
+    pthread_mutex_t mutex;
+    atomic_flag spinlock;
+};
+
+static inline void queue_lock_init(struct user_queue_lock *lock) {
+    pthread_mutex_init(&lock->mutex, NULL);
+    atomic_flag_clear(&lock->spinlock);
+}
+
+static inline void queue_spin_lock(atomic_flag *lock) {
+    while (atomic_flag_test_and_set_explicit(lock, memory_order_acquire))
+        ; // Spin
+}
+
+static inline void queue_spin_unlock(atomic_flag *lock) {
+    atomic_flag_clear_explicit(lock, memory_order_release);
+}
+
+static inline void queue_mutex_lock(pthread_mutex_t *lock) {
+    pthread_mutex_lock(lock);
+}
+
+static inline void queue_mutex_unlock(pthread_mutex_t *lock) {
+    pthread_mutex_unlock(lock);
+}
+
+struct octboot_net_sw_desc_ptr {
+    union {
+        uint64_t val;
+        struct {
+			uint64_t rsvd:47;
+			uint64_t used:1; /* allocated or not */
+			uint64_t ptr_len:16; /* length of this buf */
+        } s_mgmt_net;
+    } hdr;
+    uint64_t ptr; /* pktbuf address */
+}__attribute__((packed));
+
 struct octboot_net_sw_descq {
-    int local_prod_idx;
-    int local_cons_idx;
-    int element_count;
-    int mask;
-    int pending;
+    struct user_queue_lock lock;
+    uint32_t mask;
+    uint32_t status;
+    uint32_t pending;
+
+    uint32_t local_prod_idx;
+    uint32_t local_cons_idx;
+    void* vaddr_pktbuf;
+    void* iova_pktbuf;
 
     void* vaddr_prod_idx;
     void* iova_prod_idx;
     void* vaddr_cons_idx;
     void* iova_cons_idx;
 
-    void* dma_list;
-    void* skb_list;
-
-    void* hw_descq;
+    struct octboot_net_sw_desc_ptr sw_desc_arr[OCTBOOT_NET_NUM_ELEMENTS];
+    uint8_t* hw_descq;
+    uint32_t* hw_prod_idx;
+    uint32_t* hw_cons_idx;
 };
 
 typedef struct {
@@ -70,6 +120,81 @@ typedef struct {
     struct octboot_net_sw_descq rxq[OCTBOOT_NET_MAXQ];
 	struct octboot_net_sw_descq txq[OCTBOOT_NET_MAXQ];
 } octboot_net_device_t;
+
+static inline uint32_t octboot_net_circq_add(uint32_t index, uint32_t add,
+    uint32_t mask)
+{
+return (index + add) & mask;
+}
+
+static inline uint32_t octboot_net_circq_inc(uint32_t index, uint32_t mask)
+{
+return octboot_net_circq_add(index, 1, mask);
+}
+
+static inline uint32_t octboot_net_circq_depth(uint32_t pi, uint32_t ci,
+  uint32_t mask)
+{
+return (pi - ci) & mask;
+}
+
+static inline uint32_t octboot_net_circq_space(uint32_t pi, uint32_t ci,
+  uint32_t mask)
+{
+return mask - octboot_net_circq_depth(pi, ci, mask);
+}
+
+int mdev_clean_rx_ring(octboot_net_device_t* mdev) {
+    struct octboot_net_sw_descq* rq = &mdev->rxq[0];
+    if (rq->status == OCTBOOT_NET_DESCQ_CLEAN)
+        return 0;
+
+    rq->mask = 0;
+    rq->pending = 0;
+    rq->local_prod_idx = 0;
+    rq->local_cons_idx = 0;
+    int sw_descq_tot_size = OCTBOOT_NET_NUM_ELEMENTS * sizeof(struct octboot_net_sw_desc_ptr);
+    memset(rq->sw_desc_arr, 0, sw_descq_tot_size);
+
+    int descq_tot_size = sizeof(struct octboot_net_hw_descq) +
+		(OCTBOOT_NET_NUM_ELEMENTS * sizeof(struct octboot_net_hw_desc_ptr));
+	wmb();
+	mmio_memset(rq->hw_descq, 0, descq_tot_size);
+
+    rq->hw_descq = NULL;
+    rq->hw_prod_idx = NULL;
+    rq->hw_cons_idx = NULL;
+    rq->status = OCTBOOT_NET_DESCQ_CLEAN;
+    return 0;
+}
+
+int vfio_dma_unmap_pktbuf(octboot_net_device_t* mdev) {
+    if (mdev == NULL) {
+        fprintf(stderr, "invalid parameter of mdev\n");
+        return -1;
+    }
+
+    struct vfio_iommu_type1_dma_unmap dma_unmap1 = {
+        .argsz = sizeof(dma_unmap1),
+        .size = OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
+        .iova = (uint64_t)mdev->rxq[0].iova_pktbuf
+    };
+    ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap1);
+    munmap(mdev->rxq[0].vaddr_pktbuf, OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS);
+    mdev->rxq[0].vaddr_pktbuf = NULL;
+    mdev->rxq[0].iova_pktbuf = NULL;
+
+    struct vfio_iommu_type1_dma_unmap dma_unmap2 = {
+        .argsz = sizeof(dma_unmap2),
+        .size = OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
+        .iova = (uint64_t)mdev->txq[0].iova_pktbuf
+    };
+    ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap2);
+    munmap(mdev->txq[0].vaddr_pktbuf, OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS);
+    mdev->txq[0].vaddr_pktbuf = NULL;
+    mdev->txq[0].iova_pktbuf = NULL;
+    return 0;
+}
 
 int vfio_dma_unmap_circq(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
@@ -136,13 +261,13 @@ int vfio_bar_unmap(octboot_net_device_t* mdev) {
     return 0;
 }
 
-int vfio_uninit(octboot_net_device_t* mdev)
-{
+int vfio_uninit(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         fprintf(stderr, "invalid parameter of mdev\n");
         return -1;
     }
 
+    vfio_dma_unmap_pktbuf(mdev);
     vfio_dma_unmap_circq(mdev);
     vfio_bar_unmap(mdev);
 
@@ -164,8 +289,7 @@ int vfio_uninit(octboot_net_device_t* mdev)
     return 0;
 }
 
-int vfio_bar_map(octboot_net_device_t* mdev)
-{
+int vfio_bar_map(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         fprintf(stderr, "invalid parameter of mdev\n");
         return -1;
@@ -261,8 +385,86 @@ int vfio_dma_map_circq(octboot_net_device_t* mdev) {
     return 0;
 }
 
-int vfio_init(octboot_net_device_t* mdev)
-{
+int vfio_dma_map_pktbuf(octboot_net_device_t* mdev) {
+
+    mdev->rxq[0].vaddr_pktbuf = mmap(NULL, OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct vfio_iommu_type1_dma_map dma_map1 = {
+        .argsz = sizeof(dma_map1),
+        .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+        .vaddr = (__u64)mdev->rxq[0].vaddr_pktbuf,
+        .size = OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
+        .iova = 0
+    };
+    if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map1)) {
+        fprintf(stderr, "failed to map dma pktbuf\n");
+        return -1;
+    }
+    mdev->rxq[0].iova_pktbuf = (void*)dma_map1.iova;
+
+    mdev->txq[0].vaddr_pktbuf = mmap(NULL, OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct vfio_iommu_type1_dma_map dma_map2 = {
+        .argsz = sizeof(dma_map2),
+        .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+        .vaddr = (__u64)mdev->txq[0].vaddr_pktbuf,
+        .size = OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
+        .iova = 0
+    };
+    if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map2)) {
+        fprintf(stderr, "failed to map dma pktbuf\n");
+        return -1;
+    }
+    mdev->txq[0].iova_pktbuf = (void*)dma_map2.iova;
+    return 0;
+}
+
+int mdev_setup_rx_ring(octboot_net_device_t* mdev) {
+    struct octboot_net_sw_descq* rq = &mdev->rxq[0];
+    rq->mask = OCTBOOT_NET_NUM_ELEMENTS - 1;
+    rq->pending = 0;
+    rq->local_prod_idx = 0;
+    rq->local_cons_idx = 0;
+    rq->hw_descq = (uint8_t*)RX_DESCQ_OFFSET(mdev);
+    rq->hw_prod_idx = (uint32_t *)(rq->hw_descq +
+        offsetof(struct octboot_net_hw_descq, prod_idx));
+    *(uint32_t*)rq->vaddr_cons_idx = 0;
+
+    int descq_tot_size = sizeof(struct octboot_net_hw_descq) + (OCTBOOT_NET_NUM_ELEMENTS *
+		sizeof(struct octboot_net_hw_desc_ptr));
+    struct octboot_net_hw_descq *descq = calloc(1, descq_tot_size);
+    if (!descq) {
+        fprintf(stderr, "Failed to allocate descq\n");
+        return -1;
+    }
+
+    descq->num_entries = OCTBOOT_NET_NUM_ELEMENTS;
+    descq->buf_size = OCTBOOT_NET_RX_BUF_SIZE;
+    descq->shadow_cons_idx_addr = (uint64_t)mdev->rxq[0].iova_cons_idx;
+
+    for (int i = 0; i < OCTBOOT_NET_NUM_ELEMENTS; i++) {
+        struct octboot_net_sw_desc_ptr* swptr = &rq->sw_desc_arr[i];
+        memset(swptr, 0, sizeof(struct octboot_net_sw_desc_ptr));
+        swptr->ptr = (uint64_t)((uint8_t*)mdev->rxq[0].vaddr_pktbuf + (i * OCTBOOT_NET_RX_BUF_SIZE));
+
+        struct octboot_net_hw_desc_ptr* ptr = &descq->desc_arr[i];
+        memset(ptr, 0, sizeof(struct octboot_net_hw_desc_ptr));
+        ptr->hdr.s_mgmt_net.ptr_type = OCTBOOT_NET_DESC_PTR_DIRECT;
+        ptr->ptr = (uint64_t)((uint8_t*)mdev->rxq[0].iova_pktbuf + (i * OCTBOOT_NET_RX_BUF_SIZE));
+        rq->local_prod_idx = octboot_net_circq_inc(rq->local_prod_idx,
+            rq->mask);
+        descq->prod_idx = octboot_net_circq_inc(descq->prod_idx, rq->mask);
+    }
+    rq->status = OCTBOOT_NET_DESCQ_READY;
+    queue_lock_init(&rq->lock);
+
+    wmb();
+    mmio_memwrite(rq->hw_descq, descq, descq_tot_size);
+    free(descq);
+    return 0;
+}
+
+int vfio_init(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         fprintf(stderr, "invalid parameter of mdev\n");
         return -1;
@@ -314,6 +516,12 @@ int vfio_init(octboot_net_device_t* mdev)
         return -1;
     }
 
+    if (vfio_dma_map_pktbuf(mdev) < 0) {
+        fprintf(stderr, "failed to map dma pktbuf\n");
+        vfio_uninit(mdev);
+        return -1;
+    }
+
     return 0;
 }
 
@@ -336,6 +544,10 @@ int main(int argc, char *argv[]) {
         octbootdev[i].txq[0].iova_prod_idx = NULL;
         octbootdev[i].txq[0].vaddr_cons_idx = NULL;
         octbootdev[i].txq[0].iova_cons_idx = NULL;
+        octbootdev[i].rxq[0].vaddr_pktbuf = NULL;
+        octbootdev[i].rxq[0].iova_pktbuf = NULL;
+        octbootdev[i].txq[0].vaddr_pktbuf = NULL;
+        octbootdev[i].txq[0].iova_pktbuf = NULL;
     }
 
     if (argc != 3) {

@@ -38,15 +38,20 @@
 #define OCTBOOT_NET_NUM_ELEMENTS 256
 
 struct octboot_net_sw_descq {
-    int q_num;
     int local_prod_idx;
     int local_cons_idx;
     int element_count;
     int mask;
     int pending;
-    void* cons_idx_shadow;
+
+    void* vaddr_prod_idx;
+    void* iova_prod_idx;
+    void* vaddr_cons_idx;
+    void* iova_cons_idx;
+
     void* dma_list;
     void* skb_list;
+
     void* hw_descq;
 };
 
@@ -62,30 +67,55 @@ typedef struct {
     int group_fd;
     int device_fd;
     bar_map_t bar_map[NUM_BARS];
-    int dma_size;
-    void* mmap_addr;
-    void* iova_addr;
-
     struct octboot_net_sw_descq rxq[OCTBOOT_NET_MAXQ];
 	struct octboot_net_sw_descq txq[OCTBOOT_NET_MAXQ];
 } octboot_net_device_t;
 
-int vfio_dma_unmap(octboot_net_device_t* mdev) {
+int vfio_dma_unmap_circq(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         fprintf(stderr, "invalid parameter of mdev\n");
         return -1;
     }
 
-    struct vfio_iommu_type1_dma_unmap dma_unmap = {
-        .argsz = sizeof(dma_unmap),
-        .size = mdev->dma_size,
-        .iova = (uint64_t)mdev->iova_addr
+    struct vfio_iommu_type1_dma_unmap dma_unmap1 = {
+        .argsz = sizeof(dma_unmap1),
+        .size = OCTBOOT_NET_MAXQ,
+        .iova = (uint64_t)mdev->rxq[0].iova_prod_idx
     };
-    ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap);
-    munmap(mdev->mmap_addr, mdev->dma_size);
-    mdev->mmap_addr = NULL;
-    mdev->iova_addr = NULL;
-    mdev->dma_size = 0;
+    ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap1);
+    munmap(mdev->rxq[0].vaddr_prod_idx, OCTBOOT_NET_MAXQ);
+    mdev->rxq[0].vaddr_prod_idx = NULL;
+    mdev->rxq[0].iova_prod_idx = NULL;
+
+    struct vfio_iommu_type1_dma_unmap dma_unmap2 = {
+        .argsz = sizeof(dma_unmap2),
+        .size = OCTBOOT_NET_MAXQ,
+        .iova = (uint64_t)mdev->rxq[0].iova_cons_idx
+    };
+    ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap2);
+    munmap(mdev->rxq[0].vaddr_cons_idx, OCTBOOT_NET_MAXQ);
+    mdev->rxq[0].vaddr_cons_idx = NULL;
+    mdev->rxq[0].iova_cons_idx = NULL;
+
+    struct vfio_iommu_type1_dma_unmap dma_unmap3 = {
+        .argsz = sizeof(dma_unmap3),
+        .size = OCTBOOT_NET_MAXQ,
+        .iova = (uint64_t)mdev->txq[0].iova_prod_idx
+    };
+    ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap3);
+    munmap(mdev->txq[0].vaddr_prod_idx, OCTBOOT_NET_MAXQ);
+    mdev->txq[0].vaddr_prod_idx = NULL;
+    mdev->txq[0].iova_prod_idx = NULL;
+
+    struct vfio_iommu_type1_dma_unmap dma_unmap4 = {
+        .argsz = sizeof(dma_unmap4),
+        .size = OCTBOOT_NET_MAXQ,
+        .iova = (uint64_t)mdev->txq[0].iova_cons_idx
+    };
+    ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap4);
+    munmap(mdev->txq[0].vaddr_cons_idx, OCTBOOT_NET_MAXQ);
+    mdev->txq[0].vaddr_cons_idx = NULL;
+    mdev->txq[0].iova_cons_idx = NULL;
     return 0;
 }
 
@@ -113,7 +143,7 @@ int vfio_uninit(octboot_net_device_t* mdev)
         return -1;
     }
 
-    vfio_dma_unmap(mdev);
+    vfio_dma_unmap_circq(mdev);
     vfio_bar_unmap(mdev);
 
     if (mdev->device_fd > 0) {
@@ -168,22 +198,66 @@ int vfio_bar_map(octboot_net_device_t* mdev)
     return 0;
 }
 
-int vfio_dma_map(octboot_net_device_t* mdev) {
-    mdev->dma_size = OCTBOOT_NET_RX_BUF_SIZE;
-    mdev->mmap_addr = mmap(NULL, mdev->dma_size, PROT_READ | PROT_WRITE,
+int vfio_dma_map_circq(octboot_net_device_t* mdev) {
+    mdev->rxq[0].vaddr_prod_idx = mmap(NULL, OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    struct vfio_iommu_type1_dma_map dma_map = {
-        .argsz = sizeof(dma_map),
+    struct vfio_iommu_type1_dma_map dma_map1 = {
+        .argsz = sizeof(dma_map1),
         .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
-        .vaddr = (__u64)mdev->mmap_addr,
-        .size = mdev->dma_size,
+        .vaddr = (__u64)mdev->rxq[0].vaddr_prod_idx,
+        .size = OCTBOOT_NET_MAXQ,
         .iova = 0
     };
-    if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map)) {
+    if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map1)) {
         fprintf(stderr, "failed to map dma\n");
         return -1;
     }
-    mdev->iova_addr = (void*)dma_map.iova;
+    mdev->rxq[0].iova_prod_idx = (void*)dma_map1.iova;
+
+    mdev->rxq[0].vaddr_cons_idx = mmap(NULL, OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct vfio_iommu_type1_dma_map dma_map2 = {
+        .argsz = sizeof(dma_map2),
+        .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+        .vaddr = (__u64)mdev->rxq[0].vaddr_cons_idx,
+        .size = OCTBOOT_NET_MAXQ,
+        .iova = 0
+    };
+    if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map2)) {
+        fprintf(stderr, "failed to map dma\n");
+        return -1;
+    }
+    mdev->rxq[0].iova_cons_idx = (void*)dma_map2.iova;
+
+    mdev->txq[0].vaddr_prod_idx = mmap(NULL, OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct vfio_iommu_type1_dma_map dma_map3 = {
+        .argsz = sizeof(dma_map3),
+        .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+        .vaddr = (__u64)mdev->txq[0].vaddr_prod_idx,
+        .size = OCTBOOT_NET_MAXQ,
+        .iova = 0
+    };
+    if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map3)) {
+        fprintf(stderr, "failed to map dma\n");
+        return -1;
+    }
+    mdev->txq[0].iova_prod_idx = (void*)dma_map3.iova;
+
+    mdev->txq[0].vaddr_cons_idx = mmap(NULL, OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct vfio_iommu_type1_dma_map dma_map4 = {
+        .argsz = sizeof(dma_map4),
+        .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+        .vaddr = (__u64)mdev->txq[0].vaddr_cons_idx,
+        .size = OCTBOOT_NET_MAXQ,
+        .iova = 0
+    };
+    if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map4)) {
+        fprintf(stderr, "failed to map dma\n");
+        return -1;
+    }
+    mdev->txq[0].iova_cons_idx = (void*)dma_map4.iova;
     return 0;
 }
 
@@ -234,7 +308,7 @@ int vfio_init(octboot_net_device_t* mdev)
         return -1;
     }
 
-    if (vfio_dma_map(mdev) < 0) {
+    if (vfio_dma_map_circq(mdev) < 0) {
         fprintf(stderr, "failed to map dma\n");
         vfio_uninit(mdev);
         return -1;
@@ -254,9 +328,14 @@ int main(int argc, char *argv[]) {
             octbootdev[i].bar_map[j].bar_addr = NULL;
             octbootdev[i].bar_map[j].bar_size = 0;
         }
-        octbootdev[i].mmap_addr = NULL;
-        octbootdev[i].iova_addr = NULL;
-        octbootdev[i].dma_size = 0;
+        octbootdev[i].rxq[0].vaddr_prod_idx = NULL;
+        octbootdev[i].rxq[0].iova_prod_idx = NULL;
+        octbootdev[i].rxq[0].vaddr_cons_idx = NULL;
+        octbootdev[i].rxq[0].iova_cons_idx = NULL;
+        octbootdev[i].txq[0].vaddr_prod_idx = NULL;
+        octbootdev[i].txq[0].iova_prod_idx = NULL;
+        octbootdev[i].txq[0].vaddr_cons_idx = NULL;
+        octbootdev[i].txq[0].iova_cons_idx = NULL;
     }
 
     if (argc != 3) {

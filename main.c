@@ -108,6 +108,12 @@
 #define THREAD_SLEEP_US 1000
 #define VETH_INTERFACE_NAME "veth0"
 
+// kernel -> user space
+#define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
+#define WRITE_ONCE(x, val) __atomic_store_n(&(x), (val), __ATOMIC_RELAXED)
+#define likely(x)      __builtin_expect(!!(x), 1)
+#define unlikely(x)    __builtin_expect(!!(x), 0)
+
 struct octboot_net_mbox_hdr {
 	uint64_t opcode  :8;
 	uint64_t id      :8;
@@ -144,8 +150,11 @@ struct user_queue_lock {
 struct octboot_net_sw_descq {
     struct user_queue_lock lock;
     uint32_t mask;
-    uint32_t status;
     uint32_t pending;
+    uint32_t status;
+    uint64_t pkts;
+	uint64_t bytes;
+	uint64_t errors;
 
     uint32_t local_prod_idx;
     uint32_t local_cons_idx;
@@ -210,26 +219,22 @@ static inline void queue_mutex_unlock(pthread_mutex_t *lock) {
 }
 
 static inline uint32_t octboot_net_circq_add(uint32_t index, uint32_t add,
-    uint32_t mask)
-{
-return (index + add) & mask;
+    uint32_t mask) {
+    return (index + add) & mask;
 }
 
-static inline uint32_t octboot_net_circq_inc(uint32_t index, uint32_t mask)
-{
-return octboot_net_circq_add(index, 1, mask);
+static inline uint32_t octboot_net_circq_inc(uint32_t index, uint32_t mask) {
+    return octboot_net_circq_add(index, 1, mask);
 }
 
 static inline uint32_t octboot_net_circq_depth(uint32_t pi, uint32_t ci,
-  uint32_t mask)
-{
-return (pi - ci) & mask;
+  uint32_t mask) {
+    return (pi - ci) & mask;
 }
 
 static inline uint32_t octboot_net_circq_space(uint32_t pi, uint32_t ci,
-  uint32_t mask)
-{
-return mask - octboot_net_circq_depth(pi, ci, mask);
+  uint32_t mask) {
+    return mask - octboot_net_circq_depth(pi, ci, mask);
 }
 
 int mdev_clean_tx_ring(octboot_net_device_t* mdev) {
@@ -238,6 +243,9 @@ int mdev_clean_tx_ring(octboot_net_device_t* mdev) {
     tq->pending = 1;
     tq->local_prod_idx = 0;
     tq->local_cons_idx = 0;
+    tq->pkts = 0;
+    tq->bytes = 0;
+    tq->errors = 0;
     int sw_descq_tot_size = OCTBOOT_NET_NUM_ELEMENTS * sizeof(struct octboot_net_sw_desc_ptr);
     memset(tq->sw_desc_arr, 0, sw_descq_tot_size);
 
@@ -259,6 +267,9 @@ int mdev_clean_rx_ring(octboot_net_device_t* mdev) {
     rq->pending = 1;
     rq->local_prod_idx = 0;
     rq->local_cons_idx = 0;
+    rq->pkts = 0;
+    rq->bytes = 0;
+    rq->errors = 0;
     int sw_descq_tot_size = OCTBOOT_NET_NUM_ELEMENTS * sizeof(struct octboot_net_sw_desc_ptr);
     memset(rq->sw_desc_arr, 0, sw_descq_tot_size);
 
@@ -531,6 +542,9 @@ int mdev_setup_rx_ring(octboot_net_device_t* mdev) {
     rq->pending = 1;
     rq->local_prod_idx = 0;
     rq->local_cons_idx = 0;
+    rq->pkts = 0;
+    rq->bytes = 0;
+    rq->errors = 0;
     rq->hw_descq = (uint8_t*)RX_DESCQ_OFFSET(mdev);
     rq->hw_prod_idx = (uint32_t *)(rq->hw_descq +
         offsetof(struct octboot_net_hw_descq, prod_idx));
@@ -578,6 +592,9 @@ int mdev_setup_tx_ring(octboot_net_device_t* mdev) {
     tq->pending = 1;
     tq->local_prod_idx = 0;
     tq->local_cons_idx = 0;
+    tq->pkts = 0;
+    tq->bytes = 0;
+    tq->errors = 0;
     tq->hw_descq = (uint8_t*)TX_DESCQ_OFFSET(mdev);
     tq->hw_prod_idx = (uint32_t *)(tq->hw_descq +
         offsetof(struct octboot_net_hw_descq, prod_idx));
@@ -706,6 +723,61 @@ static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
     struct octboot_net_sw_descq* rq = &mdev->rxq[0];
     if (rq->status != OCTBOOT_NET_DESCQ_READY) {
         return;
+    }
+
+	uint32_t hw_cons_idx = READ_ONCE(*(uint32_t*)rq->vaddr_cons_idx);
+    uint32_t cons_idx = READ_ONCE(rq->local_cons_idx);
+    if (unlikely(cons_idx == 0xFFFFFFFF) || unlikely(hw_cons_idx == 0xFFFFFFFF)) {
+        fprintf(stderr, "hw_cons_idx=0x%x cons_idx=0x%x\n", hw_cons_idx, cons_idx);
+        return;
+	}
+
+    int count = octboot_net_circq_depth(hw_cons_idx,  cons_idx, rq->mask);
+    if (count == 0) {
+        return;
+    }
+
+    int start = cons_idx;
+    uint8_t *hw_desc_ptr;
+    struct octboot_net_hw_desc_ptr ptr;
+    ssize_t bytes_sent;
+    for (int i = 0; i < count; i++) {
+        hw_desc_ptr = rq->hw_descq + OCTBOOT_NET_DESC_ARR_ENTRY_OFFSET(start);
+        mmio_memread(&ptr, hw_desc_ptr, sizeof(struct octboot_net_hw_desc_ptr));
+        if (unlikely(ptr.hdr.s_mgmt_net.total_len < ETH_ZLEN ||
+		    ptr.hdr.s_mgmt_net.is_frag ||
+		    ptr.hdr.s_mgmt_net.ptr_len != ptr.hdr.s_mgmt_net.ptr_len)) {
+			/* dont handle frags now */
+			rq->errors++;
+            fprintf(stderr, "rq->error increases to %ld due to frags\n", rq->errors);
+        } else {
+            rq->pkts += 1;
+			rq->bytes += ptr.hdr.s_mgmt_net.total_len;
+            bytes_sent = send(sock_fd, (uint8_t*)rq->vaddr_pktbuf + (start * OCTBOOT_NET_RX_BUF_SIZE),
+                ptr.hdr.s_mgmt_net.total_len, 0);
+            if (bytes_sent != ptr.hdr.s_mgmt_net.total_len) {
+                fprintf(stderr, "Partial send: %zd of %u bytes\n", bytes_sent, ptr.hdr.s_mgmt_net.total_len);
+                return;
+            }
+        }
+        start = octboot_net_circq_inc(start, rq->mask);
+    }
+
+    wmb();
+	cons_idx = octboot_net_circq_add(cons_idx, count, rq->mask);
+    WRITE_ONCE(rq->local_cons_idx, cons_idx);
+    wmb();
+
+    // receive all the packets until no increasing of cons_idx
+    hw_cons_idx = READ_ONCE(*(uint32_t*)rq->vaddr_cons_idx);
+    cons_idx = READ_ONCE(rq->local_cons_idx);
+    if (unlikely(cons_idx == 0xFFFFFFFF) || unlikely(hw_cons_idx == 0xFFFFFFFF)) {
+        fprintf(stderr, "hw_cons_idx=0x%x cons_idx=0x%x\n", hw_cons_idx, cons_idx);
+        return;
+	}
+    count = octboot_net_circq_depth(hw_cons_idx,  cons_idx, rq->mask);
+    if (count > 0) {
+        octeon_handle_rxq(mdev, sock_fd);
     }
 }
 

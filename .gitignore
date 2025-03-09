@@ -1,2 +1,5 @@
 # binary
 user_space_octboot_net
+
+# object
+*.o

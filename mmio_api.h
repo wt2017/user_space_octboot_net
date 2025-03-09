@@ -28,6 +28,34 @@
     #define mb()  __sync_synchronize()
 #endif
 
+static inline void writel(uint32_t value, volatile void *addr)
+{
+    *((volatile uint32_t *)addr) = value;
+    wmb();  // Write memory barrier to ensure order
+}
+
+static inline uint32_t readl(const volatile void *addr)
+{
+    uint32_t value;
+    value = *((volatile uint32_t *)addr);
+    rmb();  // Read memory barrier to ensure order
+    return value;
+}
+
+static inline uint64_t readq(const volatile void *addr)
+{
+    uint64_t value;
+    value = *((volatile uint64_t *)addr);
+    rmb();  // Read memory barrier
+    return value;
+}
+
+static inline void writeq(uint64_t value, volatile void *addr)
+{
+    *((volatile uint64_t *)addr) = value;
+    wmb();  // Write memory barrier
+}
+
 // 8-bit MMIO operations
 static inline void writeb_relaxed(uint8_t value, volatile void *addr)
 {

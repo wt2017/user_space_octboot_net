@@ -130,18 +130,6 @@ union octboot_net_mbox_msg {
 	} s;
 } __packed;
 
-struct octboot_net_sw_desc_ptr {
-    union {
-        uint64_t val;
-        struct {
-			uint64_t rsvd:47;
-			uint64_t used:1; /* allocated or not */
-			uint64_t ptr_len:16; /* length of this buf */
-        } s_mgmt_net;
-    } hdr;
-    uint64_t ptr; /* pktbuf address */
-}__attribute__((packed));
-
 struct user_queue_lock {
     pthread_mutex_t mutex;
     atomic_flag spinlock;
@@ -150,7 +138,6 @@ struct user_queue_lock {
 struct octboot_net_sw_descq {
     struct user_queue_lock lock;
     uint32_t mask;
-    uint32_t pending;
     uint32_t status;
     uint64_t pkts;
 	uint64_t bytes;
@@ -166,7 +153,6 @@ struct octboot_net_sw_descq {
     void* vaddr_cons_idx;
     void* iova_cons_idx;
 
-    struct octboot_net_sw_desc_ptr sw_desc_arr[OCTBOOT_NET_NUM_ELEMENTS];
     uint8_t* hw_descq;
     uint32_t* hw_prod_idx;
     uint32_t* hw_cons_idx;
@@ -240,14 +226,11 @@ static inline uint32_t octboot_net_circq_space(uint32_t pi, uint32_t ci,
 int mdev_clean_tx_ring(octboot_net_device_t* mdev) {
     struct octboot_net_sw_descq* tq = &mdev->txq[0];
     tq->mask = 0;
-    tq->pending = 1;
     tq->local_prod_idx = 0;
     tq->local_cons_idx = 0;
     tq->pkts = 0;
     tq->bytes = 0;
     tq->errors = 0;
-    int sw_descq_tot_size = OCTBOOT_NET_NUM_ELEMENTS * sizeof(struct octboot_net_sw_desc_ptr);
-    memset(tq->sw_desc_arr, 0, sw_descq_tot_size);
 
     int descq_tot_size = sizeof(struct octboot_net_hw_descq) +
         (OCTBOOT_NET_NUM_ELEMENTS * sizeof(struct octboot_net_hw_desc_ptr));
@@ -264,14 +247,11 @@ int mdev_clean_tx_ring(octboot_net_device_t* mdev) {
 int mdev_clean_rx_ring(octboot_net_device_t* mdev) {
     struct octboot_net_sw_descq* rq = &mdev->rxq[0];
     rq->mask = 0;
-    rq->pending = 1;
     rq->local_prod_idx = 0;
     rq->local_cons_idx = 0;
     rq->pkts = 0;
     rq->bytes = 0;
     rq->errors = 0;
-    int sw_descq_tot_size = OCTBOOT_NET_NUM_ELEMENTS * sizeof(struct octboot_net_sw_desc_ptr);
-    memset(rq->sw_desc_arr, 0, sw_descq_tot_size);
 
     int descq_tot_size = sizeof(struct octboot_net_hw_descq) +
 		(OCTBOOT_NET_NUM_ELEMENTS * sizeof(struct octboot_net_hw_desc_ptr));
@@ -539,7 +519,6 @@ int vfio_dma_map_pktbuf(octboot_net_device_t* mdev) {
 int mdev_setup_rx_ring(octboot_net_device_t* mdev) {
     struct octboot_net_sw_descq* rq = &mdev->rxq[0];
     rq->mask = OCTBOOT_NET_NUM_ELEMENTS - 1;
-    rq->pending = 1;
     rq->local_prod_idx = 0;
     rq->local_cons_idx = 0;
     rq->pkts = 0;
@@ -565,10 +544,6 @@ int mdev_setup_rx_ring(octboot_net_device_t* mdev) {
     descq->shadow_cons_idx_addr = (uint64_t)mdev->rxq[0].iova_cons_idx;
 
     for (int i = 0; i < OCTBOOT_NET_NUM_ELEMENTS; i++) {
-        struct octboot_net_sw_desc_ptr* swptr = &rq->sw_desc_arr[i];
-        memset(swptr, 0, sizeof(struct octboot_net_sw_desc_ptr));
-        swptr->ptr = (uint64_t)((uint8_t*)mdev->rxq[0].vaddr_pktbuf + (i * OCTBOOT_NET_RX_BUF_SIZE));
-
         struct octboot_net_hw_desc_ptr* ptr = &descq->desc_arr[i];
         memset(ptr, 0, sizeof(struct octboot_net_hw_desc_ptr));
         ptr->hdr.s_mgmt_net.ptr_type = OCTBOOT_NET_DESC_PTR_DIRECT;
@@ -589,7 +564,6 @@ int mdev_setup_rx_ring(octboot_net_device_t* mdev) {
 int mdev_setup_tx_ring(octboot_net_device_t* mdev) {
     struct octboot_net_sw_descq* tq = &mdev->txq[0];
     tq->mask = OCTBOOT_NET_NUM_ELEMENTS - 1;
-    tq->pending = 1;
     tq->local_prod_idx = 0;
     tq->local_cons_idx = 0;
     tq->pkts = 0;
@@ -615,10 +589,6 @@ int mdev_setup_tx_ring(octboot_net_device_t* mdev) {
     descq->shadow_cons_idx_addr = (uint64_t)mdev->txq[0].iova_cons_idx;
 
     for (int i = 0; i < OCTBOOT_NET_NUM_ELEMENTS; i++) {
-        struct octboot_net_sw_desc_ptr* swptr = &tq->sw_desc_arr[i];
-        memset(swptr, 0, sizeof(struct octboot_net_sw_desc_ptr));
-        swptr->ptr = (uint64_t)((uint8_t*)mdev->txq[0].vaddr_pktbuf + (i * OCTBOOT_NET_RX_BUF_SIZE));
-
         struct octboot_net_hw_desc_ptr* ptr = &descq->desc_arr[i];
         memset(ptr, 0, sizeof(struct octboot_net_hw_desc_ptr));
         ptr->hdr.s_mgmt_net.ptr_type = OCTBOOT_NET_DESC_PTR_DIRECT;
@@ -745,6 +715,7 @@ static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
         hw_desc_ptr = rq->hw_descq + OCTBOOT_NET_DESC_ARR_ENTRY_OFFSET(start);
         mmio_memread(&ptr, hw_desc_ptr, sizeof(struct octboot_net_hw_desc_ptr));
         if (unlikely(ptr.hdr.s_mgmt_net.total_len < ETH_ZLEN ||
+            ptr.hdr.s_mgmt_net.total_len > OCTBOOT_NET_RX_BUF_SIZE ||
 		    ptr.hdr.s_mgmt_net.is_frag ||
 		    ptr.hdr.s_mgmt_net.ptr_len != ptr.hdr.s_mgmt_net.ptr_len)) {
 			/* dont handle frags now */
@@ -753,6 +724,11 @@ static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
         } else {
             rq->pkts += 1;
 			rq->bytes += ptr.hdr.s_mgmt_net.total_len;
+            uint8_t* pktbuf = (uint8_t*)rq->iova_pktbuf + (start * OCTBOOT_NET_RX_BUF_SIZE);
+            if (ptr.ptr != (uint64_t)pktbuf) {
+                fprintf(stderr, "ptr.ptr != pktbuf in rxq\n");
+                return;
+            }
             bytes_sent = send(sock_fd, (uint8_t*)rq->vaddr_pktbuf + (start * OCTBOOT_NET_RX_BUF_SIZE),
                 ptr.hdr.s_mgmt_net.total_len, 0);
             if (bytes_sent != ptr.hdr.s_mgmt_net.total_len) {
@@ -787,13 +763,65 @@ void* octeon_thread_func(void* arg) {
         usleep(THREAD_SLEEP_US);
 
         octeon_handle_mbox(params->mdev); // not completed yet
-        octeon_handle_rxq(params->mdev, params->veth_fd); // not completed yet
+        octeon_handle_rxq(params->mdev, params->veth_fd);
     }
     return NULL;
 }
 
 static void veth_handle_rawsock(int sock_fd, octboot_net_device_t* mdev) {
+    struct octboot_net_sw_descq* tq = &mdev->txq[0];
+    if (tq->status != OCTBOOT_NET_DESCQ_READY) {
+        return;
+    }
 
+    while (1) {
+
+        uint32_t prod_idx = READ_ONCE(tq->local_prod_idx);
+        uint32_t cons_idx = READ_ONCE(*(uint32_t*)tq->vaddr_cons_idx);
+        
+        if (unlikely(prod_idx == 0xFFFFFFFF) || unlikely(cons_idx == 0xFFFFFFFF)) {
+            fprintf(stderr, "Invalid indices prod_idx=0x%x cons_idx=0x%x\n", 
+                    prod_idx, cons_idx);
+            break;
+        }
+
+        if (octboot_net_circq_space(prod_idx, cons_idx, tq->mask) == 0) {
+            // no send buffer left
+            break;
+        }
+
+        uint8_t* pkt_buffer = (uint8_t*)tq->vaddr_pktbuf + (prod_idx * OCTBOOT_NET_RX_BUF_SIZE);
+        ssize_t recv_len = recv(sock_fd, pkt_buffer, OCTBOOT_NET_RX_BUF_SIZE, MSG_DONTWAIT);
+        if (recv_len < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                fprintf(stderr, "Failed to receive packet: %s\n", strerror(errno));
+            }
+            break;
+        }
+
+        if (recv_len < ETH_ZLEN || recv_len > OCTBOOT_NET_RX_BUF_SIZE) {
+            tq->errors++;
+            break;
+        }
+
+        struct octboot_net_hw_desc_ptr ptr;
+        memset(&ptr, 0, sizeof(struct octboot_net_hw_desc_ptr));
+        ptr.hdr.s_mgmt_net.total_len = recv_len;
+        ptr.hdr.s_mgmt_net.ptr_len = recv_len;
+        ptr.hdr.s_mgmt_net.ptr_type = OCTBOOT_NET_DESC_PTR_DIRECT;
+        ptr.ptr = (uint64_t)((uint8_t*)tq->iova_pktbuf + (prod_idx * OCTBOOT_NET_RX_BUF_SIZE));
+        uint8_t* hw_desc_ptr = tq->hw_descq + OCTBOOT_NET_DESC_ARR_ENTRY_OFFSET(prod_idx);
+        mmio_memwrite(hw_desc_ptr, &ptr, sizeof(struct octboot_net_hw_desc_ptr));
+
+        wmb();
+        prod_idx = octboot_net_circq_inc(prod_idx, tq->mask);
+        WRITE_ONCE(tq->local_prod_idx, prod_idx);
+        tq->pkts  += 1;
+        tq->bytes += recv_len;
+    }
+
+	wmb();
+    writel(tq->local_prod_idx, tq->hw_prod_idx);
 }
 
 void* veth_thread_func(void* arg) {

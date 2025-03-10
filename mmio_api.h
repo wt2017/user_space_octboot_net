@@ -28,6 +28,34 @@
     #define mb()  __sync_synchronize()
 #endif
 
+static inline void writeb(uint8_t value, volatile void *addr)
+{
+    *((volatile uint8_t *)addr) = value;
+    wmb();  // Write memory barrier to ensure order
+}
+
+static inline uint8_t readb(const volatile void *addr)
+{
+    uint8_t value;
+    value = *((volatile uint8_t *)addr);
+    rmb();  // Read memory barrier to ensure order
+    return value;
+}
+
+static inline void writes(uint16_t value, volatile void *addr)
+{
+    *((volatile uint16_t *)addr) = value;
+    wmb();  // Write memory barrier to ensure order
+}
+
+static inline uint16_t reads(const volatile void *addr)
+{
+    uint16_t value;
+    value = *((volatile uint16_t *)addr);
+    rmb();  // Read memory barrier to ensure order
+    return value;
+}
+
 static inline void writel(uint32_t value, volatile void *addr)
 {
     *((volatile uint32_t *)addr) = value;

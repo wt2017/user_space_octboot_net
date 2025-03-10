@@ -20,7 +20,8 @@
 #include "mmio_api.h"
 
 #define NUM_DEVICES                 3
-#define NUM_BARS                    3
+#define NUM_BARS                    3  // BAR0, BAR2, BAR4
+#define BAR0                        0
 #define BAR4                        (NUM_BARS-1)
 #define OCTBOOT_NET_MAXQ            1
 #define OCTBOOT_NET_DESCQ_CLEAN 0
@@ -106,6 +107,7 @@
 #define OCTBOOT_NET_NUM_ELEMENTS 256
 
 #define THREAD_SLEEP_US 1000
+#define OCTBOOT_NET_SERVICE_TASK_US_FLR 6000000 // 6s
 #define VETH_INTERFACE_NAME "veth0"
 
 // kernel -> user space
@@ -164,11 +166,17 @@ typedef struct {
 } bar_map_t;
 
 typedef struct {
+    void* conf_addr;
+    int conf_size;
+} conf_map_t;
+
+typedef struct {
     char vfio_path[32];
     char pci_addr[32];
 	int container_fd;
     int group_fd;
     int device_fd;
+    conf_map_t conf_map;
     bar_map_t bar_map[NUM_BARS];
     struct octboot_net_sw_descq rxq[OCTBOOT_NET_MAXQ];
 	struct octboot_net_sw_descq txq[OCTBOOT_NET_MAXQ];
@@ -358,6 +366,20 @@ int vfio_bar_unmap(octboot_net_device_t* mdev) {
     return 0;
 }
 
+int vfio_conf_unmap(octboot_net_device_t* mdev) {
+    if (mdev == NULL) {
+        fprintf(stderr, "invalid parameter of mdev\n");
+        return -1;
+    }
+
+    if (mdev->conf_map.conf_addr != NULL && mdev->conf_map.conf_addr != MAP_FAILED) {
+        munmap(mdev->conf_map.conf_addr, mdev->conf_map.conf_size);
+        mdev->conf_map.conf_addr = NULL;
+        mdev->conf_map.conf_size = 0;
+    }
+    return 0;
+}
+
 int vfio_uninit(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         fprintf(stderr, "invalid parameter of mdev\n");
@@ -367,6 +389,7 @@ int vfio_uninit(octboot_net_device_t* mdev) {
     vfio_dma_unmap_pktbuf(mdev);
     vfio_dma_unmap_circq(mdev);
     vfio_bar_unmap(mdev);
+    vfio_conf_unmap(mdev);
 
     if (mdev->device_fd > 0) {
         close(mdev->device_fd);
@@ -386,6 +409,31 @@ int vfio_uninit(octboot_net_device_t* mdev) {
     return 0;
 }
 
+int vfio_conf_map(octboot_net_device_t* mdev) {
+    struct vfio_region_info reg = {
+        .argsz = sizeof(reg),
+        .index = VFIO_PCI_CONFIG_REGION_INDEX
+    };
+    if (ioctl(mdev->device_fd, VFIO_DEVICE_GET_REGION_INFO, &reg)) {
+        fprintf(stderr, "failed to get conf region info\n");
+        vfio_uninit(mdev);
+        return -1;
+    }
+
+    mdev->conf_map.conf_size = reg.size;
+    mdev->conf_map.conf_addr = mmap(NULL, reg.size, 
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,  // Note: should be MAP_SHARED not MAP_PRIVATE
+        mdev->device_fd,
+        reg.offset);  // Use reg.offset for BAR mapping
+    if (mdev->conf_map.conf_addr == MAP_FAILED) {
+        fprintf(stderr, "failed to map conf\n");
+        vfio_uninit(mdev);
+        return -1;
+    }
+    return 0;
+}
+
 int vfio_bar_map(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         fprintf(stderr, "invalid parameter of mdev\n");
@@ -398,7 +446,7 @@ int vfio_bar_map(octboot_net_device_t* mdev) {
             .index = VFIO_PCI_BAR0_REGION_INDEX + (i * 2) // BAR0, BAR2, BAR4
         };
         if (ioctl(mdev->device_fd, VFIO_DEVICE_GET_REGION_INFO, &reg)) {
-            fprintf(stderr, "failed to get region info\n");
+            fprintf(stderr, "failed to get bar region info\n");
             vfio_uninit(mdev);
             return -1;
         }
@@ -645,6 +693,11 @@ int vfio_init(octboot_net_device_t* mdev) {
         return -1;
     }
 
+    if (vfio_conf_map(mdev) < 0) {
+        fprintf(stderr, "failed to map conf\n");
+        vfio_uninit(mdev);
+        return -1;
+    }
 
     if (vfio_bar_map(mdev) < 0) {
         fprintf(stderr, "failed to map bars\n");
@@ -882,6 +935,86 @@ int veth_setup_raw_socket(const char* if_name) {
     }
 
     return sock_fd;
+}
+/********************************************************************************************
+ ***********************************     pci_regs.h   ***************************************
+#define PCI_VENDOR_ID		0x00
+#define PCI_DEVICE_ID		0x02
+#define PCI_COMMAND		0x04
+#define  PCI_COMMAND_IO		0x1
+#define  PCI_COMMAND_MEMORY	0x2
+#define  PCI_COMMAND_MASTER	0x4
+
+#define PCI_CAPABILITY_LIST	0x34
+#define PCI_EXP_DEVCTL		0x08
+********************************************************************************************/
+#define PCI_CAPABILITY_LIST	                    0x34
+#define  PCI_CAP_ID_EXP		                    0x10
+#define PCI_EXP_DEVCTL		                    0x08
+#define  PCI_EXP_DEVCTL_BCR_FLR                 0x8000
+#define PCI_CONF_REG(mdev)                      ((uint8_t*)mdev->conf_map.conf_addr)
+#define PCI_CONF_CMD_REG(mdev)                  ((uint8_t*)mdev->conf_map.conf_addr + 0x04)
+
+
+#define CNXK_SDP_WIN_WR_MASK_REG                0x20030
+#define CNXK_RST_CHIP_DOMAIN_W1S                0x000087E006001810ULL
+#define CNXK_SDP_WIN_WR_ADDR64                  0x20000
+#define CNXK_SDP_WIN_WR_DATA64                  0x20020
+#define CNXK_SDP_WIN_WR_ADDR64_REG(mdev)        ((uint8_t*)mdev->bar_map[BAR0].bar_addr + CNXK_SDP_WIN_WR_ADDR64)
+#define CNXK_SDP_WIN_WR_DATA64_REG(mdev)        ((uint8_t*)mdev->bar_map[BAR0].bar_addr + CNXK_SDP_WIN_WR_DATA64)
+
+#define FW_STATUS_DOWNING                       0ULL
+#define CNXK_PCIEEP_VSECST_CTL                  0x418
+#define CNXK_PEMX_PFX_CSX_PFCFGX(pem, pf, offset)      ((0x8e0000008000 | (uint64_t)pem << 36 \
+                                                | pf << 18 \
+                                                | ((offset >> 16) & 1) << 16 \
+                                                | (offset >> 3) << 3) \
+                                                + (((offset >> 2) & 1) << 2))
+void reset_fw_ready_state(octboot_net_device_t* mdev) {
+    writeq(CNXK_PEMX_PFX_CSX_PFCFGX(0, 0, CNXK_PCIEEP_VSECST_CTL), CNXK_SDP_WIN_WR_ADDR64_REG(mdev));
+    writeq(FW_STATUS_DOWNING, CNXK_SDP_WIN_WR_DATA64_REG(mdev));
+}
+
+void pci_enable_device(octboot_net_device_t* mdev) {
+    uint16_t cmd = reads(PCI_CONF_CMD_REG(mdev));
+    /* 
+    bit0: PCI_COMMAND_IO
+    bit1: PCI_COMMAND_MEMORY
+    bit2: PCI_COMMAND_MASTER, for DMA operation
+    */ 
+    cmd |= 0x07;
+    writes(cmd, PCI_CONF_CMD_REG(mdev));
+}
+
+static int find_pcie_cap(octboot_net_device_t* mdev)
+{
+    uint8_t pos = 0x34;
+    uint8_t cap_id;
+    
+    while (pos) {
+        cap_id = readb(PCI_CONF_REG(mdev) + pos);
+        
+        if (cap_id == PCI_CAP_ID_EXP)
+            return pos;
+
+        // next pos
+        pos = readb(PCI_CONF_REG(mdev) + (pos + 1));
+    }
+    
+    return 0;
+}
+
+void pci_reset_function(octboot_net_device_t* mdev) {
+    int pos = find_pcie_cap(mdev);
+    if (pos == 0) {
+        fprintf(stderr, "pcie_cap is not found");
+        return;
+    }
+
+    uint16_t devctl = reads(PCI_CONF_REG(mdev) + pos + PCI_EXP_DEVCTL);
+    devctl |= PCI_EXP_DEVCTL_BCR_FLR;
+    writes(devctl, PCI_CONF_REG(mdev) + pos + PCI_EXP_DEVCTL);
+    usleep(OCTBOOT_NET_SERVICE_TASK_US_FLR);
 }
 
 int main(int argc, char *argv[]) {

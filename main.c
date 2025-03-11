@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
@@ -26,46 +27,6 @@
 #define OCTBOOT_NET_MAXQ            1
 #define OCTBOOT_NET_DESCQ_CLEAN 0
 #define OCTBOOT_NET_DESCQ_READY 1
-
-#define NPU_HANDSHAKE_SIGNATURE 0xABCDABCD
-#define SIGNATURE_OFFSET 0x2000000 /* BAR4 index 8 is at this offset */
-#define HOST_VERSION_OFFSET 0x2000008
-#define HOST_STATUS_REG_OFFSET 0x2000080
-
-#define OCTNET_HOST_DOWN                 0
-#define OCTNET_HOST_READY                1
-#define OCTNET_HOST_RUNNING              2
-#define OCTNET_HOST_GOING_DOWN           3
-#define OCTNET_HOST_FATAL                4
-
-#define HOST_RESET_STATUS_REG_OFFSET 0x2000088
-#define OCTNET_HOST_RESET_STATUS_BIT     0
-
-#define HOST_MBOX_ACK_OFFSET 0x2000090
-#define HOST_MBOX_OFFSET 0x2000098    /* Eight words at this offset */
-#define TARGET_VERSION_OFFSET 0x2000060
-#define TARGET_STATUS_REG_OFFSET 0x2000100
-
-
-#define HOST_STATUS_REG(mdev)      ((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_STATUS_REG_OFFSET)
-#define HOST_RESET_STATUS_REG(mdev) ((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_RESET_STATUS_REG_OFFSET)
-#define HOST_VERSION_REG(mdev)      ((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_VERSION_OFFSET)
-#define HOST_MBOX_ACK_REG(mdev)    ((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_MBOX_ACK_OFFSET)
-#define HOST_MBOX_MSG_REG(mdev, i)    \
-	((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_MBOX_OFFSET + (i * 8))
-
-
-#define OCTNET_TARGET_DOWN               0
-#define OCTNET_TARGET_READY              1
-#define OCTNET_TARGET_RUNNING            2
-#define OCTNET_TARGET_GOING_DOWN         3
-#define OCTNET_TARGET_FATAL              4
-
-
-#define TARGET_MBOX_OFFSET 0x2000118
-#define TARGET_MBOX_ACK_OFFSET 0x2000110
-#define OCTNET_RX_DESC_OFFSET 0x20000B8
-#define OCTNET_TX_DESC_OFFSET 0x20000c0
 
 #define OCTNET_TX_DESCQ_OFFSET      0x2000400
 #define OCTNET_RX_DESCQ_OFFSET      0x2010000
@@ -106,6 +67,7 @@
 
 #define OCTBOOT_NET_NUM_ELEMENTS 256
 
+#define INIT_SLEEP_US 1000000
 #define THREAD_SLEEP_US 1000
 #define OCTBOOT_NET_SERVICE_TASK_US_FLR 6000000 // 6s
 #define VETH_INTERFACE_NAME "veth0"
@@ -132,13 +94,7 @@ union octboot_net_mbox_msg {
 	} s;
 } __packed;
 
-struct user_queue_lock {
-    pthread_mutex_t mutex;
-    atomic_flag spinlock;
-};
-
 struct octboot_net_sw_descq {
-    struct user_queue_lock lock;
     uint32_t mask;
     uint32_t status;
     uint64_t pkts;
@@ -170,19 +126,34 @@ typedef struct {
     int conf_size;
 } conf_map_t;
 
+struct uboot_pcinet_barmap {
+	uint64_t signature;
+	uint64_t host_version;
+	uint64_t host_status_reg;
+	uint64_t host_mailbox_ack;
+	uint64_t host_mailbox[8];
+	uint64_t target_version;
+	uint64_t target_status_reg;
+	uint64_t target_mailbox_ack;
+	uint64_t target_mailbox[8];
+	uint64_t rx_descriptor_offset;
+	uint64_t tx_descriptor_offset;
+};
+
 typedef struct {
     char vfio_path[32];
     char pci_addr[32];
 	int container_fd;
     int group_fd;
     int device_fd;
+    struct uboot_pcinet_barmap npu_memmap_info;
+    bool signature_found;
+    uint32_t send_mbox_id;
+	uint32_t recv_mbox_id;
     conf_map_t conf_map;
     bar_map_t bar_map[NUM_BARS];
     struct octboot_net_sw_descq rxq[OCTBOOT_NET_MAXQ];
 	struct octboot_net_sw_descq txq[OCTBOOT_NET_MAXQ];
-
-    uint32_t send_mbox_id;
-	uint32_t recv_mbox_id;
 } octboot_net_device_t;
 
 typedef struct {
@@ -190,27 +161,20 @@ typedef struct {
     int veth_fd;
 } thread_params_t;
 
-static inline void queue_lock_init(struct user_queue_lock *lock) {
-    pthread_mutex_init(&lock->mutex, NULL);
-    atomic_flag_clear(&lock->spinlock);
-}
+typedef enum {
+    STATUS_SUSPENDED,
+    STATUS_RUNNING
+} pthread_status_t;
 
-static inline void queue_spin_lock(atomic_flag *lock) {
-    while (atomic_flag_test_and_set_explicit(lock, memory_order_acquire))
-        ; // Spin
-}
-
-static inline void queue_spin_unlock(atomic_flag *lock) {
-    atomic_flag_clear_explicit(lock, memory_order_release);
-}
-
-static inline void queue_mutex_lock(pthread_mutex_t *lock) {
-    pthread_mutex_lock(lock);
-}
-
-static inline void queue_mutex_unlock(pthread_mutex_t *lock) {
-    pthread_mutex_unlock(lock);
-}
+struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_status_t status;
+} controller = {
+    PTHREAD_MUTEX_INITIALIZER,
+    PTHREAD_COND_INITIALIZER,
+    STATUS_SUSPENDED
+};
 
 static inline uint32_t octboot_net_circq_add(uint32_t index, uint32_t add,
     uint32_t mask) {
@@ -380,7 +344,7 @@ int vfio_conf_unmap(octboot_net_device_t* mdev) {
     return 0;
 }
 
-int vfio_uninit(octboot_net_device_t* mdev) {
+int dma_uninit(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         fprintf(stderr, "invalid parameter of mdev\n");
         return -1;
@@ -388,6 +352,15 @@ int vfio_uninit(octboot_net_device_t* mdev) {
 
     vfio_dma_unmap_pktbuf(mdev);
     vfio_dma_unmap_circq(mdev);
+    return 0;
+}
+
+int vfio_uninit(octboot_net_device_t* mdev) {
+    if (mdev == NULL) {
+        fprintf(stderr, "invalid parameter of mdev\n");
+        return -1;
+    }
+
     vfio_bar_unmap(mdev);
     vfio_conf_unmap(mdev);
 
@@ -601,7 +574,6 @@ int mdev_setup_rx_ring(octboot_net_device_t* mdev) {
         descq->prod_idx = octboot_net_circq_inc(descq->prod_idx, rq->mask);
     }
     rq->status = OCTBOOT_NET_DESCQ_READY;
-    queue_lock_init(&rq->lock);
 
     wmb();
     mmio_memwrite(rq->hw_descq, descq, descq_tot_size);
@@ -646,11 +618,31 @@ int mdev_setup_tx_ring(octboot_net_device_t* mdev) {
         descq->prod_idx = octboot_net_circq_inc(descq->prod_idx, tq->mask);
     }
     tq->status = OCTBOOT_NET_DESCQ_READY;
-    queue_lock_init(&tq->lock);
 
     wmb();
     mmio_memwrite(tq->hw_descq, descq, descq_tot_size);
     free(descq);
+    return 0;
+}
+
+int dma_init(octboot_net_device_t* mdev) {
+    if (mdev == NULL) {
+        fprintf(stderr, "invalid parameter of mdev\n");
+        return -1;
+    }
+
+    if (vfio_dma_map_circq(mdev) < 0) {
+        fprintf(stderr, "failed to map dma\n");
+        dma_uninit(mdev);
+        return -1;
+    }
+
+    if (vfio_dma_map_pktbuf(mdev) < 0) {
+        fprintf(stderr, "failed to map dma pktbuf\n");
+        dma_uninit(mdev);
+        return -1;
+    }
+
     return 0;
 }
 
@@ -705,41 +697,7 @@ int vfio_init(octboot_net_device_t* mdev) {
         return -1;
     }
 
-    if (vfio_dma_map_circq(mdev) < 0) {
-        fprintf(stderr, "failed to map dma\n");
-        vfio_uninit(mdev);
-        return -1;
-    }
-
-    if (vfio_dma_map_pktbuf(mdev) < 0) {
-        fprintf(stderr, "failed to map dma pktbuf\n");
-        vfio_uninit(mdev);
-        return -1;
-    }
-
     return 0;
-}
-
-static int mbox_check_msg_rcvd(octboot_net_device_t* mdev,
-    union octboot_net_mbox_msg *msg) {
-    int i = 0;
-    msg->words[0] = readq(TARGET_MBOX_MSG_REG(mdev, 0));
-	if (mdev->recv_mbox_id != msg->s.hdr.id) {
-		mdev->recv_mbox_id = msg->s.hdr.id;
-		for (i = 1; i <= msg->s.hdr.sizew; i++)
-			msg->words[i] = readq(TARGET_MBOX_MSG_REG(mdev, i));
-		return i;
-	}
-
-    return 0;
-}
-
-static void octeon_handle_mbox(octboot_net_device_t* mdev) {
-    union octboot_net_mbox_msg msg;
-    int word_num = mbox_check_msg_rcvd(mdev, &msg);
-    if (word_num == 0) {
-        return;
-    }
 }
 
 static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
@@ -815,8 +773,16 @@ void* octeon_thread_func(void* arg) {
     while (1) {
         usleep(THREAD_SLEEP_US);
 
-        octeon_handle_mbox(params->mdev); // not completed yet
+        pthread_mutex_lock(&controller.mutex);
+        while (controller.status == STATUS_SUSPENDED) {
+            pthread_cond_wait(&controller.cond, &controller.mutex);
+        }
+
+        // start
         octeon_handle_rxq(params->mdev, params->veth_fd);
+        // end
+
+        pthread_mutex_unlock(&controller.mutex);
     }
     return NULL;
 }
@@ -882,7 +848,16 @@ void* veth_thread_func(void* arg) {
     while (1) {
         usleep(THREAD_SLEEP_US);
 
+        pthread_mutex_lock(&controller.mutex);
+        while (controller.status == STATUS_SUSPENDED) {
+            pthread_cond_wait(&controller.cond, &controller.mutex);
+        }
+
+        // start
         veth_handle_rawsock(params->veth_fd, params->mdev);
+        // end
+
+        pthread_mutex_unlock(&controller.mutex);
     }
     return NULL;
 }
@@ -936,8 +911,51 @@ int veth_setup_raw_socket(const char* if_name) {
 
     return sock_fd;
 }
+
 /********************************************************************************************
- ***********************************     pci_regs.h   ***************************************
+ ********************************     Target Management   ***********************************
+********************************************************************************************/
+#define NPU_HANDSHAKE_SIGNATURE 0xABCDABCD
+#define SIGNATURE_OFFSET 0x2000000 /* BAR4 index 8 is at this offset */
+#define HOST_VERSION_OFFSET 0x2000008
+#define HOST_STATUS_REG_OFFSET 0x2000080
+
+#define OCTNET_HOST_DOWN                 0
+#define OCTNET_HOST_READY                1
+#define OCTNET_HOST_RUNNING              2
+#define OCTNET_HOST_GOING_DOWN           3
+#define OCTNET_HOST_FATAL                4
+
+#define HOST_RESET_STATUS_REG_OFFSET 0x2000088
+#define OCTNET_HOST_RESET_STATUS_BIT     0
+
+#define HOST_MBOX_ACK_OFFSET 0x2000090
+#define HOST_MBOX_OFFSET 0x2000098    /* Eight words at this offset */
+#define TARGET_VERSION_OFFSET 0x2000060
+#define TARGET_STATUS_REG_OFFSET 0x2000100
+
+
+#define HOST_STATUS_REG(mdev)      ((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_STATUS_REG_OFFSET)
+#define HOST_RESET_STATUS_REG(mdev) ((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_RESET_STATUS_REG_OFFSET)
+#define HOST_VERSION_REG(mdev)      ((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_VERSION_OFFSET)
+#define HOST_MBOX_ACK_REG(mdev)    ((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_MBOX_ACK_OFFSET)
+#define HOST_MBOX_MSG_REG(mdev, i)    \
+	((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_MBOX_OFFSET + (i * 8))
+
+
+#define OCTNET_TARGET_DOWN               0
+#define OCTNET_TARGET_READY              1
+#define OCTNET_TARGET_RUNNING            2
+#define OCTNET_TARGET_GOING_DOWN         3
+#define OCTNET_TARGET_FATAL              4
+
+
+#define TARGET_MBOX_OFFSET 0x2000118
+#define TARGET_MBOX_ACK_OFFSET 0x2000110
+#define OCTNET_RX_DESC_OFFSET 0x20000B8
+#define OCTNET_TX_DESC_OFFSET 0x20000c0
+
+/***********************************     pci_regs.h   ***************************************
 #define PCI_VENDOR_ID		0x00
 #define PCI_DEVICE_ID		0x02
 #define PCI_COMMAND		0x04
@@ -970,6 +988,9 @@ int veth_setup_raw_socket(const char* if_name) {
                                                 | ((offset >> 16) & 1) << 16 \
                                                 | (offset >> 3) << 3) \
                                                 + (((offset >> 2) & 1) << 2))
+
+#define SIGNATURE_REG(mdev)                     ((uint8_t*)mdev->bar_map[BAR4].bar_addr + SIGNATURE_OFFSET)
+
 void reset_fw_ready_state(octboot_net_device_t* mdev) {
     writeq(CNXK_PEMX_PFX_CSX_PFCFGX(0, 0, CNXK_PCIEEP_VSECST_CTL), CNXK_SDP_WIN_WR_ADDR64_REG(mdev));
     writeq(FW_STATUS_DOWNING, CNXK_SDP_WIN_WR_DATA64_REG(mdev));
@@ -1005,6 +1026,11 @@ static int find_pcie_cap(octboot_net_device_t* mdev)
 }
 
 void pci_reset_function(octboot_net_device_t* mdev) {
+    if (mdev == NULL) {
+        fprintf(stderr, "invalid parameter of mdev\n");
+        return;
+    }
+
     int pos = find_pcie_cap(mdev);
     if (pos == 0) {
         fprintf(stderr, "pcie_cap is not found");
@@ -1015,6 +1041,121 @@ void pci_reset_function(octboot_net_device_t* mdev) {
     devctl |= PCI_EXP_DEVCTL_BCR_FLR;
     writes(devctl, PCI_CONF_REG(mdev) + pos + PCI_EXP_DEVCTL);
     usleep(OCTBOOT_NET_SERVICE_TASK_US_FLR);
+}
+
+static uint64_t get_target_status(octboot_net_device_t* mdev)
+{
+	return readq(TARGET_STATUS_REG(mdev));
+}
+
+static uint64_t get_target_version(octboot_net_device_t* mdev)
+{
+	return readq(TARGET_VERSION_REG(mdev));
+}
+
+static uint64_t get_target_mbox_ack(octboot_net_device_t* mdev)
+{
+	return readq(TARGET_MBOX_ACK_REG(mdev));
+}
+
+static void set_host_mbox_ack_reg(octboot_net_device_t* mdev, uint32_t id)
+{
+	writeq(id, HOST_MBOX_ACK_REG(mdev));
+}
+
+static void mbox_send_msg(octboot_net_device_t* mdev,
+		union octboot_net_mbox_msg *msg)
+{
+	mdev->send_mbox_id++;
+	msg->s.hdr.id = mdev->send_mbox_id;
+	uint64_t id = msg->s.hdr.id;
+	for (uint8_t i = 1; i <= msg->s.hdr.sizew; i++)
+		writeq(msg->words[i], HOST_MBOX_MSG_REG(mdev, i));
+	writeq(msg->words[0], HOST_MBOX_MSG_REG(mdev, 0));
+
+	if (msg->s.hdr.req_ack || msg->s.hdr.sizew) {
+        int retry = 10;
+		while (get_target_mbox_ack(mdev) != id && retry > 0 ) {
+			usleep(OCTBOOT_NET_MBOX_WAIT_MS*1000);
+            retry--;
+		}
+	}
+}
+
+static void change_host_status(octboot_net_device_t* mdev, uint64_t status,
+			bool ack_wait)
+{
+	union octboot_net_mbox_msg msg;
+	writeq(status, HOST_STATUS_REG(mdev));
+	memset(&msg, 0, sizeof(union octboot_net_mbox_msg));
+	msg.s.hdr.opcode = OCTBOOT_NET_MBOX_HOST_STATUS_CHANGE;
+	if (ack_wait)
+		msg.s.hdr.req_ack = 1;
+	mbox_send_msg(mdev, &msg);
+}
+
+static int mbox_check_msg_rcvd(octboot_net_device_t* mdev,
+    union octboot_net_mbox_msg *msg) {
+    int i = 0;
+    if (mdev == NULL) {
+        fprintf(stderr, "invalid parameter of mdev\n");
+        return -1;
+    }
+
+    msg->words[0] = readq(TARGET_MBOX_MSG_REG(mdev, 0));
+	if (mdev->recv_mbox_id != msg->s.hdr.id) {
+		mdev->recv_mbox_id = msg->s.hdr.id;
+		for (i = 1; i <= msg->s.hdr.sizew; i++)
+			msg->words[i] = readq(TARGET_MBOX_MSG_REG(mdev, i));
+		return i;
+	}
+
+    return 0;
+}
+
+static int octeon_target_setup(octboot_net_device_t* mdev) {
+    if (mdev == NULL) {
+        fprintf(stderr, "invalid parameter of mdev\n");
+        return -1;
+    }
+
+    // pci_reset_function(mdev);
+    // pci_enable_device(mdev);
+
+    memcpy(&mdev->npu_memmap_info, SIGNATURE_REG(mdev),
+			sizeof(struct uboot_pcinet_barmap));
+    uint64_t signature = mdev->npu_memmap_info.signature;
+    if (signature == NPU_HANDSHAKE_SIGNATURE) {
+        if (!mdev->signature_found) {
+           mdev->signature_found = true;
+        }
+    } else {
+        if (mdev->signature_found) {
+            mdev->signature_found = false;
+            fprintf(stderr, "signature is found before, but now misaligned with target\n");
+        }
+        return -1;
+    }
+
+    union octboot_net_mbox_msg msg;
+    int word_num = mbox_check_msg_rcvd(mdev, &msg);
+    if (word_num == 0) {
+        return -1;
+    }
+/*
+    switch (msg.s.hdr.opcode) {
+    case OCTBOOT_NET_MBOX_TARGET_STATUS_CHANGE:
+        handle_target_status(mdev);
+        if (msg.s.hdr.req_ack)
+            set_host_mbox_ack_reg(mdev, msg.s.hdr.id);
+        break;
+    case OCTBOOT_NET_MBOX_OPCODE_INVALID:
+        return -1;
+    default:
+        break;
+    }
+*/
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -1028,6 +1169,10 @@ int main(int argc, char *argv[]) {
             octbootdev[i].bar_map[j].bar_addr = NULL;
             octbootdev[i].bar_map[j].bar_size = 0;
         }
+        octbootdev[i].signature_found = false;
+        memset(&octbootdev[i].npu_memmap_info, 0, sizeof(octbootdev[i].npu_memmap_info));
+        octbootdev[i].send_mbox_id = 0;
+        octbootdev[i].recv_mbox_id = 0;
         octbootdev[i].rxq[0].vaddr_prod_idx = NULL;
         octbootdev[i].rxq[0].iova_prod_idx = NULL;
         octbootdev[i].rxq[0].vaddr_cons_idx = NULL;
@@ -1051,8 +1196,20 @@ int main(int argc, char *argv[]) {
     snprintf(octbootdev[0].vfio_path, sizeof(octbootdev[0].vfio_path), "/dev/vfio/%s", argv[1]);
     snprintf(octbootdev[0].pci_addr, sizeof(octbootdev[0].pci_addr), "%s", argv[2]);
 
-    if (vfio_init(&octbootdev[0]) < 0) {
+    while (vfio_init(&octbootdev[0]) < 0) {
         fprintf(stderr, "failed to init vfio\n");
+        usleep(INIT_SLEEP_US);
+    }
+    fprintf(stderr, "vfio is initiated successfully\n");
+
+    if (octeon_target_setup(&octbootdev[0]) < 0) {
+        fprintf(stderr, "failed to setup target\n");
+        usleep(INIT_SLEEP_US);
+    }
+    fprintf(stderr, "octeon target comes up\n");
+
+    if (dma_init(&octbootdev[0]) < 0) {
+        fprintf(stderr, "failed to init dma\n");
         return -1;
     }
 

@@ -966,6 +966,10 @@ int veth_setup_raw_socket(const char* if_name) {
 #define PCI_CAPABILITY_LIST	0x34
 #define PCI_EXP_DEVCTL		0x08
 ********************************************************************************************/
+#define OCTBOOT_NET_VERSION "1.0"
+#define OCTBOOT_NET_VERSION_MAJOR 1
+#define OCTBOOT_NET_VERSION_MINOR 0
+
 #define PCI_CAPABILITY_LIST	                    0x34
 #define  PCI_CAP_ID_EXP		                    0x10
 #define PCI_EXP_DEVCTL		                    0x08
@@ -1043,6 +1047,11 @@ void pci_reset_function(octboot_net_device_t* mdev) {
     usleep(OCTBOOT_NET_SERVICE_TASK_US_FLR);
 }
 
+static uint64_t get_host_status(octboot_net_device_t* mdev)
+{
+	return readq(HOST_STATUS_REG(mdev));
+}
+
 static uint64_t get_target_status(octboot_net_device_t* mdev)
 {
 	return readq(TARGET_STATUS_REG(mdev));
@@ -1113,6 +1122,48 @@ static int mbox_check_msg_rcvd(octboot_net_device_t* mdev,
     return 0;
 }
 
+static int handle_target_status(octboot_net_device_t* mdev)
+{
+	int ret = 0;
+	uint64_t host_status = get_host_status(mdev);
+	uint64_t target_status = get_target_status(mdev);
+	fprintf(stderr, "host status %lu\n", host_status);
+	fprintf(stderr, "target status %lu\n", target_status);
+
+	switch (host_status) {
+	case OCTNET_HOST_READY:
+		if (target_status == OCTNET_TARGET_RUNNING) {
+			fprintf(stderr, "octboot_net: target running\n");
+			change_host_status(mdev, OCTNET_HOST_RUNNING, false);
+		}
+		break;
+	case OCTNET_HOST_RUNNING:
+		target_status = get_target_status(mdev);
+		if (target_status != OCTNET_TARGET_RUNNING) {
+			fprintf(stderr, "octboot_net: target stopped\n");
+			change_host_status(mdev, OCTNET_HOST_GOING_DOWN,
+						   false);
+            /* reset when txq/rxq running case is not included */
+			ret |= mdev_clean_tx_ring(mdev);
+            ret |= mdev_clean_rx_ring(mdev);
+            ret |= mdev_setup_tx_ring(mdev);
+            ret |= mdev_setup_rx_ring(mdev);
+			if (ret) {
+				change_host_status(mdev, OCTNET_HOST_FATAL,
+						   false);
+				return ret;
+			}
+			change_host_status(mdev, OCTNET_HOST_READY, false);
+		}
+		break;
+	default:
+		fprintf(stderr, "octboot_net: unhandled state transition host_status:%lu target_status %lu\n",
+		       host_status, target_status);
+		break;
+	}
+	return ret;
+}
+
 static int octeon_target_setup(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         fprintf(stderr, "invalid parameter of mdev\n");
@@ -1121,6 +1172,14 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
 
     // pci_reset_function(mdev);
     // pci_enable_device(mdev);
+
+    uint64_t host_version = ((OCTBOOT_NET_VERSION_MAJOR << 8)|OCTBOOT_NET_VERSION_MINOR);
+	writeq(host_version, HOST_VERSION_REG(mdev));
+	uint64_t target_version = get_target_version(mdev);
+    if ((host_version >> 8) != (target_version >> 8)) {
+        fprintf(stderr, "octboot_net driver compatible with uboot\n");
+        return -1;
+    }
 
     memcpy(&mdev->npu_memmap_info, SIGNATURE_REG(mdev),
 			sizeof(struct uboot_pcinet_barmap));
@@ -1142,7 +1201,7 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
     if (word_num == 0) {
         return -1;
     }
-/*
+
     switch (msg.s.hdr.opcode) {
     case OCTBOOT_NET_MBOX_TARGET_STATUS_CHANGE:
         handle_target_status(mdev);
@@ -1154,7 +1213,11 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
     default:
         break;
     }
-*/
+
+    if ((OCTNET_TARGET_RUNNING != get_target_status(mdev)) 
+    || OCTNET_HOST_RUNNING != get_host_status(mdev))
+        return -1;
+
     return 0;
 }
 

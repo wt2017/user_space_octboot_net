@@ -117,6 +117,7 @@ struct octboot_net_sw_descq {
 };
 
 typedef struct {
+    uint64_t phy_bar_addr;
     void* bar_addr;
     int bar_size;
 } bar_map_t;
@@ -379,6 +380,37 @@ int vfio_uninit(octboot_net_device_t* mdev) {
         mdev->container_fd = -1;
     }
 
+    return 0;
+}
+
+int mdev_get_phy_addr(octboot_net_device_t* mdev) {    
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/config", mdev->pci_addr);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "failed to open device config file");
+        return -1;
+    }
+
+    uint32_t bar_value;
+    if (pread(fd, &bar_value, sizeof(bar_value), 0x20) != sizeof(bar_value)) {
+        fprintf(stderr, "failed to read BAR4 addr");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    if ((bar_value & 0x7) == 0x4) {
+        // 64-bit BAR
+        uint32_t bar_upper;
+        pread(fd, &bar_upper, sizeof(bar_upper), 0x24);
+        mdev->bar_map[BAR4].phy_bar_addr = ((uint64_t)bar_upper << 32) | (bar_value & ~0xF);
+    } else {
+        // 32-bit BAR
+        mdev->bar_map[BAR4].phy_bar_addr = bar_value & ~0xF;
+    }
+
+    fprintf(stderr, "BAR4 phy addr: 0x%llx\n", (unsigned long long)mdev->bar_map[BAR4].phy_bar_addr);
     return 0;
 }
 

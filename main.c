@@ -392,25 +392,29 @@ int mdev_get_phy_addr(octboot_net_device_t* mdev) {
         return -1;
     }
 
-    uint32_t bar_value;
-    if (pread(fd, &bar_value, sizeof(bar_value), 0x20) != sizeof(bar_value)) {
-        fprintf(stderr, "failed to read BAR4 addr");
+    uint32_t bar_low, bar_high;
+    uint64_t bar_address;
+    if (pread(fd, &bar_low, sizeof(bar_low), 0x20) != sizeof(bar_low)) {
+        perror("failed to read BAR4 low");
         close(fd);
-        return -1;
+        return 1;
+    }
+
+    if ((bar_low & 0x7) == 0x4) {
+        // 64-bit BAR
+        if (pread(fd, &bar_high, sizeof(bar_high), 0x24) != sizeof(bar_high)) {
+            perror("failed to read BAR4 high");
+            close(fd);
+            return 1;
+        }
+        bar_address = ((uint64_t)bar_high << 32) | (bar_low & ~0xFULL);
+    } else {
+        // 32-bit BAR
+        bar_address = bar_low & ~0xFULL;
     }
     close(fd);
 
-    if ((bar_value & 0x7) == 0x4) {
-        // 64-bit BAR
-        uint32_t bar_upper;
-        pread(fd, &bar_upper, sizeof(bar_upper), 0x24);
-        mdev->bar_map[BAR4].phy_bar_addr = ((uint64_t)bar_upper << 32) | (bar_value & ~0xF);
-    } else {
-        // 32-bit BAR
-        mdev->bar_map[BAR4].phy_bar_addr = bar_value & ~0xF;
-    }
-
-    fprintf(stderr, "BAR4 phy addr: 0x%llx\n", (unsigned long long)mdev->bar_map[BAR4].phy_bar_addr);
+    printf("BAR4 phy addr: 0x%llx\n", (unsigned long long)bar_address);
     return 0;
 }
 

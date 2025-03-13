@@ -392,15 +392,17 @@ int vfio_conf_map(octboot_net_device_t* mdev) {
         vfio_uninit(mdev);
         return -1;
     }
+    fprintf(stderr, "conf region info, offset=0x%llx, size=%llu\n", reg.offset, reg.size);
 
     mdev->conf_map.conf_size = reg.size;
     mdev->conf_map.conf_addr = mmap(NULL, reg.size, 
         PROT_READ | PROT_WRITE,
+        //PROT_READ,
         MAP_SHARED,  // Note: should be MAP_SHARED not MAP_PRIVATE
         mdev->device_fd,
-        reg.offset);  // Use reg.offset for BAR mapping
+        reg.offset);  // Use reg.offset for conf mapping
     if (mdev->conf_map.conf_addr == MAP_FAILED) {
-        fprintf(stderr, "failed to map conf\n");
+        fprintf(stderr, "mmap failed: %s\n", strerror(errno));
         vfio_uninit(mdev);
         return -1;
     }
@@ -423,6 +425,7 @@ int vfio_bar_map(octboot_net_device_t* mdev) {
             vfio_uninit(mdev);
             return -1;
         }
+        fprintf(stderr, "bar%d region info, offset=0x%llx, size=%llu\n", i*2, reg.offset, reg.size);
 
         mdev->bar_map[i].bar_size = reg.size;
         mdev->bar_map[i].bar_addr = mmap(NULL, reg.size, 
@@ -435,13 +438,14 @@ int vfio_bar_map(octboot_net_device_t* mdev) {
             vfio_uninit(mdev);
             return -1;
         }
+        fprintf(stderr, "bar%d addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
     }
 
     return 0;
 }
 
 int vfio_dma_map_circq(octboot_net_device_t* mdev) {
-    mdev->rxq[0].vaddr_prod_idx = mmap(NULL, OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
+    mdev->rxq[0].vaddr_prod_idx = mmap(NULL, sizeof(uint32_t) * OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct vfio_iommu_type1_dma_map dma_map1 = {
         .argsz = sizeof(dma_map1),
@@ -456,7 +460,7 @@ int vfio_dma_map_circq(octboot_net_device_t* mdev) {
     }
     mdev->rxq[0].iova_prod_idx = (void*)dma_map1.iova;
 
-    mdev->rxq[0].vaddr_cons_idx = mmap(NULL, OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
+    mdev->rxq[0].vaddr_cons_idx = mmap(NULL, sizeof(uint32_t) * OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct vfio_iommu_type1_dma_map dma_map2 = {
         .argsz = sizeof(dma_map2),
@@ -471,7 +475,7 @@ int vfio_dma_map_circq(octboot_net_device_t* mdev) {
     }
     mdev->rxq[0].iova_cons_idx = (void*)dma_map2.iova;
 
-    mdev->txq[0].vaddr_prod_idx = mmap(NULL, OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
+    mdev->txq[0].vaddr_prod_idx = mmap(NULL, sizeof(uint32_t) * OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct vfio_iommu_type1_dma_map dma_map3 = {
         .argsz = sizeof(dma_map3),
@@ -486,7 +490,7 @@ int vfio_dma_map_circq(octboot_net_device_t* mdev) {
     }
     mdev->txq[0].iova_prod_idx = (void*)dma_map3.iova;
 
-    mdev->txq[0].vaddr_cons_idx = mmap(NULL, OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
+    mdev->txq[0].vaddr_cons_idx = mmap(NULL, sizeof(uint32_t) * OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct vfio_iommu_type1_dma_map dma_map4 = {
         .argsz = sizeof(dma_map4),
@@ -678,19 +682,20 @@ int vfio_init(octboot_net_device_t* mdev) {
         return -1;
     }
 
-    mdev->device_fd = ioctl(mdev->group_fd, VFIO_GROUP_GET_DEVICE_FD, "0000:b3:00.0");
+    mdev->device_fd = ioctl(mdev->group_fd, VFIO_GROUP_GET_DEVICE_FD, mdev->pci_addr);
     if (mdev->device_fd < 0) {
         fprintf(stderr, "failed to get device fd\n");
         vfio_uninit(mdev);
         return -1;
     }
-
+    fprintf(stderr, "device_fd=0x%x\n", mdev->device_fd);
+#if 0
     if (vfio_conf_map(mdev) < 0) {
         fprintf(stderr, "failed to map conf\n");
         vfio_uninit(mdev);
         return -1;
     }
-
+#endif
     if (vfio_bar_map(mdev) < 0) {
         fprintf(stderr, "failed to map bars\n");
         vfio_uninit(mdev);
@@ -1177,7 +1182,9 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
 	writeq(host_version, HOST_VERSION_REG(mdev));
 	uint64_t target_version = get_target_version(mdev);
     if ((host_version >> 8) != (target_version >> 8)) {
-        fprintf(stderr, "octboot_net driver compatible with uboot\n");
+        fprintf(stderr, "octboot_net driver imcompatible with uboot\n");
+        fprintf(stderr, "host_version:0x%lx\n", host_version);
+        fprintf(stderr, "target_version:0x%lx\n", target_version);
         return -1;
     }
 
@@ -1265,7 +1272,7 @@ int main(int argc, char *argv[]) {
     }
     fprintf(stderr, "vfio is initiated successfully\n");
 
-    if (octeon_target_setup(&octbootdev[0]) < 0) {
+    while (octeon_target_setup(&octbootdev[0]) < 0) {
         fprintf(stderr, "failed to setup target\n");
         usleep(INIT_SLEEP_US);
     }
@@ -1291,6 +1298,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+#if 0
     int veth_fd = veth_setup_raw_socket(VETH_INTERFACE_NAME);
     if (veth_fd < 0) {
         fprintf(stderr, "failed to setup veth\n");
@@ -1299,6 +1307,7 @@ int main(int argc, char *argv[]) {
         vfio_uninit(&octbootdev[0]);
         return -1;
     }
+#endif
 
     pthread_t octeon_thread, veth_thread;
     thread_params_t params;

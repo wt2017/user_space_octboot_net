@@ -73,6 +73,7 @@ static inline uint32_t readl(const volatile void *addr)
 static inline uint64_t readq(const volatile void *addr)
 {
     uint64_t value;
+	fprintf(stderr, "addr=0x%p\n", addr);
     value = *((volatile uint64_t *)addr);
     rmb();  // Read memory barrier
     return value;

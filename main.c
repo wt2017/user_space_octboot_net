@@ -388,7 +388,7 @@ int mdev_get_phy_addr(octboot_net_device_t* mdev) {
     snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/config", mdev->pci_addr);
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "failed to open device config file");
+        fprintf(stderr, "failed to open device config file:%s\n", path);
         return -1;
     }
 
@@ -728,6 +728,12 @@ int vfio_init(octboot_net_device_t* mdev) {
         return -1;
     }
 #endif
+
+    if (mdev_get_phy_addr(mdev) < 0) {
+        fprintf(stderr, "failed to get phy addr\n");
+        return -1;
+    }
+
     if (vfio_bar_map(mdev) < 0) {
         fprintf(stderr, "failed to map bars\n");
         vfio_uninit(mdev);

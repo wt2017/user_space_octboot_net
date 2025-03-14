@@ -126,6 +126,7 @@ typedef struct {
 } bar_map_t;
 
 typedef struct {
+    int fd;
     void* conf_addr;
     int conf_size;
 } conf_map_t;
@@ -243,7 +244,7 @@ int mdev_clean_rx_ring(octboot_net_device_t* mdev) {
 
 int vfio_dma_unmap_pktbuf(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
-        fprintf(stderr, "invalid parameter of mdev\n");
+        printf("invalid parameter of mdev\n");
         return -1;
     }
 
@@ -271,7 +272,7 @@ int vfio_dma_unmap_pktbuf(octboot_net_device_t* mdev) {
 
 int vfio_dma_unmap_circq(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
-        fprintf(stderr, "invalid parameter of mdev\n");
+        printf("invalid parameter of mdev\n");
         return -1;
     }
 
@@ -319,7 +320,7 @@ int vfio_dma_unmap_circq(octboot_net_device_t* mdev) {
 
 int mdev_bar_unmap(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
-        fprintf(stderr, "invalid parameter of mdev\n");
+        printf("invalid parameter of mdev\n");
         return -1;
     }
 
@@ -341,7 +342,7 @@ int mdev_bar_unmap(octboot_net_device_t* mdev) {
 
 int mdev_conf_unmap(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
-        fprintf(stderr, "invalid parameter of mdev\n");
+        printf("invalid parameter of mdev\n");
         return -1;
     }
 
@@ -350,12 +351,18 @@ int mdev_conf_unmap(octboot_net_device_t* mdev) {
         mdev->conf_map.conf_addr = NULL;
         mdev->conf_map.conf_size = 0;
     }
+
+    if (mdev->conf_map.fd > 0) {
+        close(mdev->conf_map.fd);
+        mdev->conf_map.fd = -1;
+    }
+
     return 0;
 }
 
 int mdev_dma_uninit(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
-        fprintf(stderr, "invalid parameter of mdev\n");
+        printf("invalid parameter of mdev\n");
         return -1;
     }
 
@@ -366,7 +373,7 @@ int mdev_dma_uninit(octboot_net_device_t* mdev) {
 
 int mdev_mm_uninit(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
-        fprintf(stderr, "invalid parameter of mdev\n");
+        printf("invalid parameter of mdev\n");
         return -1;
     }
 
@@ -396,7 +403,7 @@ int mdev_get_phy_addr(octboot_net_device_t* mdev) {
     snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/config", mdev->pci_addr);
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "failed to open device config file:%s\n", path);
+        printf("failed to open device config file:%s\n", path);
         return -1;
     }
 
@@ -405,7 +412,7 @@ int mdev_get_phy_addr(octboot_net_device_t* mdev) {
         uint64_t bar_address;
         int offset = 0x10 + i * 4;
         if (pread(fd, &bar_low, sizeof(bar_low), offset) != sizeof(bar_low)) {
-            fprintf(stderr, "failed to read BAR low");
+            printf("failed to read BAR low");
             close(fd);
             return -1;
         }
@@ -413,7 +420,7 @@ int mdev_get_phy_addr(octboot_net_device_t* mdev) {
         if ((bar_low & 0x7) == 0x4) {
             // 64-bit BAR
             if (pread(fd, &bar_high, sizeof(bar_high), offset+4) != sizeof(bar_high)) {
-                fprintf(stderr, "failed to read BAR high");
+                printf("failed to read BAR high");
                 close(fd);
                 return -1;
             }
@@ -423,7 +430,7 @@ int mdev_get_phy_addr(octboot_net_device_t* mdev) {
             bar_address = bar_low & ~0xFULL;
         }
         mdev->bar_map[i].phy_bar_addr = bar_address;
-        fprintf(stderr, "BAR%d phy addr=0x%lx\n", i, mdev->bar_map[i].phy_bar_addr);
+        printf("BAR%d phy addr=0x%lx\n", i, mdev->bar_map[i].phy_bar_addr);
     }
 
     close(fd);
@@ -431,16 +438,34 @@ int mdev_get_phy_addr(octboot_net_device_t* mdev) {
 }
 
 int mdev_conf_map(octboot_net_device_t* mdev) {
+
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/config", mdev->pci_addr);
+    mdev->conf_map.fd = open(path, O_RDWR | O_SYNC);
+    if (mdev->conf_map.fd < 0) {
+        printf("failed to open device config file:%s\n", path);
+        return -1;
+    }
+
+    mdev->conf_map.conf_size = 0x1000;    // 4KB for config space
+    off_t target = 0;
+    off_t target_base = target & ~(sysconf(_SC_PAGE_SIZE)-1);
+    mdev->conf_map.conf_size = target + mdev->conf_map.conf_size - target_base;
+    printf("mmap(%d, %d, 0x%x, 0x%x, %d, 0x%x)\n", 0, mdev->conf_map.conf_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->conf_map.fd, (int) target);
+    mdev->conf_map.conf_addr = mmap(0, mdev->conf_map.conf_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->conf_map.fd, target);
+    printf("conf addr=%p\n", mdev->conf_map.conf_addr);
+
+#if 0
     struct vfio_region_info reg = {
         .argsz = sizeof(reg),
         .index = VFIO_PCI_CONFIG_REGION_INDEX
     };
     if (ioctl(mdev->device_fd, VFIO_DEVICE_GET_REGION_INFO, &reg)) {
-        fprintf(stderr, "failed to get conf region info\n");
+        printf("failed to get conf region info\n");
         mdev_mm_uninit(mdev);
         return -1;
     }
-    fprintf(stderr, "conf region info, offset=0x%llx, size=%llu\n", reg.offset, reg.size);
+    printf("conf region info, offset=0x%llx, size=%llu\n", reg.offset, reg.size);
 
     mdev->conf_map.conf_size = reg.size;
     mdev->conf_map.conf_addr = mmap(NULL, reg.size, 
@@ -450,16 +475,17 @@ int mdev_conf_map(octboot_net_device_t* mdev) {
         mdev->device_fd,
         reg.offset);  // Use reg.offset for conf mapping
     if (mdev->conf_map.conf_addr == MAP_FAILED) {
-        fprintf(stderr, "mmap failed: %s\n", strerror(errno));
+        printf("mmap failed: %s\n", strerror(errno));
         mdev_mm_uninit(mdev);
         return -1;
     }
+#endif
     return 0;
 }
 
 int mdev_bar_map(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
-        fprintf(stderr, "invalid parameter of mdev\n");
+        printf("invalid parameter of mdev\n");
         return -1;
     }
 
@@ -468,7 +494,7 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
         snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource%d", mdev->pci_addr, i*2);
         mdev->bar_map[i].fd = open(path, O_RDWR | O_SYNC);
         if (mdev->bar_map[i].fd < 0) {
-            fprintf(stderr, "failed to open device config file:%s\n", path);
+            printf("failed to open device config file:%s\n", path);
             return -1;
         }
 
@@ -483,7 +509,7 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
             mdev->bar_map[i].bar_size = 0x4000000;   // 64MB for BAR4
             break;
         default:
-            fprintf(stderr, "invalid bar index, should never be here\n");
+            printf("invalid bar index, should never be here\n");
             return -1;
         }
 
@@ -492,7 +518,7 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
         mdev->bar_map[i].bar_size = target + mdev->bar_map[i].bar_size - target_base;
         printf("mmap(%d, %d, 0x%x, 0x%x, %d, 0x%x)\n", 0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->bar_map[i].fd, (int) target);
         mdev->bar_map[i].bar_addr = mmap(0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->bar_map[i].fd, target);
-        fprintf(stderr, "bar%d addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
+        printf("bar%d addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
     }
 
 #if 0
@@ -502,11 +528,11 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
             .index = VFIO_PCI_BAR0_REGION_INDEX + (i * 2) // BAR0, BAR2, BAR4
         };
         if (ioctl(mdev->device_fd, VFIO_DEVICE_GET_REGION_INFO, &reg)) {
-            fprintf(stderr, "failed to get bar region info\n");
+            printf("failed to get bar region info\n");
             mdev_mm_uninit(mdev);
             return -1;
         }
-        fprintf(stderr, "bar%d region info, offset=0x%llx, size=%llu\n", i*2, reg.offset, reg.size);
+        printf("bar%d region info, offset=0x%llx, size=%llu\n", i*2, reg.offset, reg.size);
 
         mdev->bar_map[i].bar_size = reg.size;
 
@@ -516,12 +542,12 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
             mdev->device_fd,
             reg.offset);  // Use reg.offset for BAR mapping
         if (mdev->bar_map[i].bar_addr == MAP_FAILED) {
-            fprintf(stderr, "failed to map bar %d\n", i);
+            printf("failed to map bar %d\n", i);
             mdev_mm_uninit(mdev);
             return -1;
         }
 
-        fprintf(stderr, "bar%d addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
+        printf("bar%d addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
     }
 #endif
     return 0;
@@ -538,7 +564,7 @@ int vfio_dma_map_circq(octboot_net_device_t* mdev) {
         .iova = 0
     };
     if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map1)) {
-        fprintf(stderr, "failed to map dma\n");
+        printf("failed to map dma\n");
         return -1;
     }
     mdev->rxq[0].iova_prod_idx = (void*)dma_map1.iova;
@@ -553,7 +579,7 @@ int vfio_dma_map_circq(octboot_net_device_t* mdev) {
         .iova = 0
     };
     if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map2)) {
-        fprintf(stderr, "failed to map dma\n");
+        printf("failed to map dma\n");
         return -1;
     }
     mdev->rxq[0].iova_cons_idx = (void*)dma_map2.iova;
@@ -568,7 +594,7 @@ int vfio_dma_map_circq(octboot_net_device_t* mdev) {
         .iova = 0
     };
     if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map3)) {
-        fprintf(stderr, "failed to map dma\n");
+        printf("failed to map dma\n");
         return -1;
     }
     mdev->txq[0].iova_prod_idx = (void*)dma_map3.iova;
@@ -583,7 +609,7 @@ int vfio_dma_map_circq(octboot_net_device_t* mdev) {
         .iova = 0
     };
     if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map4)) {
-        fprintf(stderr, "failed to map dma\n");
+        printf("failed to map dma\n");
         return -1;
     }
     mdev->txq[0].iova_cons_idx = (void*)dma_map4.iova;
@@ -602,7 +628,7 @@ int vfio_dma_map_pktbuf(octboot_net_device_t* mdev) {
         .iova = 0
     };
     if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map1)) {
-        fprintf(stderr, "failed to map dma pktbuf\n");
+        printf("failed to map dma pktbuf\n");
         return -1;
     }
     mdev->rxq[0].iova_pktbuf = (void*)dma_map1.iova;
@@ -617,7 +643,7 @@ int vfio_dma_map_pktbuf(octboot_net_device_t* mdev) {
         .iova = 0
     };
     if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map2)) {
-        fprintf(stderr, "failed to map dma pktbuf\n");
+        printf("failed to map dma pktbuf\n");
         return -1;
     }
     mdev->txq[0].iova_pktbuf = (void*)dma_map2.iova;
@@ -643,7 +669,7 @@ int mdev_setup_rx_ring(octboot_net_device_t* mdev) {
 		sizeof(struct octboot_net_hw_desc_ptr));
     struct octboot_net_hw_descq *descq = calloc(1, descq_tot_size);
     if (!descq) {
-        fprintf(stderr, "Failed to allocate descq\n");
+        printf("Failed to allocate descq\n");
         return -1;
     }
 
@@ -687,7 +713,7 @@ int mdev_setup_tx_ring(octboot_net_device_t* mdev) {
         sizeof(struct octboot_net_hw_desc_ptr));
     struct octboot_net_hw_descq *descq = calloc(1, descq_tot_size);
     if (!descq) {
-        fprintf(stderr, "Failed to allocate descq\n");
+        printf("Failed to allocate descq\n");
         return -1;
     }
 
@@ -714,18 +740,18 @@ int mdev_setup_tx_ring(octboot_net_device_t* mdev) {
 
 int mdev_dma_init(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
-        fprintf(stderr, "invalid parameter of mdev\n");
+        printf("invalid parameter of mdev\n");
         return -1;
     }
 
     if (vfio_dma_map_circq(mdev) < 0) {
-        fprintf(stderr, "failed to map dma\n");
+        printf("failed to map dma\n");
         mdev_dma_uninit(mdev);
         return -1;
     }
 
     if (vfio_dma_map_pktbuf(mdev) < 0) {
-        fprintf(stderr, "failed to map dma pktbuf\n");
+        printf("failed to map dma pktbuf\n");
         mdev_dma_uninit(mdev);
         return -1;
     }
@@ -735,54 +761,54 @@ int mdev_dma_init(octboot_net_device_t* mdev) {
 
 int mdev_mm_init(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
-        fprintf(stderr, "invalid parameter of mdev\n");
+        printf("invalid parameter of mdev\n");
         return -1;
     }
 #if 0
     mdev->container_fd = open("/dev/vfio/vfio", O_RDWR);
     if (mdev->container_fd < 0) {
-        fprintf(stderr, "failed to open vfio container\n");
+        printf("failed to open vfio container\n");
         mdev_mm_uninit(mdev);
         return -1;
     }
 
     mdev->group_fd = open(mdev->vfio_path, O_RDWR);
     if (mdev->group_fd < 0) {
-        fprintf(stderr, "failed to open vfio group\n");
+        printf("failed to open vfio group\n");
         mdev_mm_uninit(mdev);
         return -1;
     }
 
     if (ioctl(mdev->group_fd, VFIO_GROUP_SET_CONTAINER, &mdev->container_fd)) {
-        fprintf(stderr, "failed to bind vfio group to vfio container\n");
+        printf("failed to bind vfio group to vfio container\n");
         mdev_mm_uninit(mdev);
         return -1;
     }
 
     if (ioctl(mdev->container_fd, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU)) {
-        fprintf(stderr, "failed to set iommu type\n");
+        printf("failed to set iommu type\n");
         mdev_mm_uninit(mdev);
         return -1;
     }
 
     mdev->device_fd = ioctl(mdev->group_fd, VFIO_GROUP_GET_DEVICE_FD, mdev->pci_addr);
     if (mdev->device_fd < 0) {
-        fprintf(stderr, "failed to get device fd\n");
+        printf("failed to get device fd\n");
         mdev_mm_uninit(mdev);
         return -1;
     }
-    fprintf(stderr, "device_fd=0x%x\n", mdev->device_fd);
+    printf("device_fd=0x%x\n", mdev->device_fd);
 #endif
 #if 0
     if (mdev_conf_map(mdev) < 0) {
-        fprintf(stderr, "failed to map conf\n");
+        printf("failed to map conf\n");
         mdev_mm_uninit(mdev);
         return -1;
     }
 #endif
 
     if (mdev_bar_map(mdev) < 0) {
-        fprintf(stderr, "failed to map bars\n");
+        printf("failed to map bars\n");
         mdev_mm_uninit(mdev);
         return -1;
     }
@@ -799,7 +825,7 @@ static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
 	uint32_t hw_cons_idx = READ_ONCE(*(uint32_t*)rq->vaddr_cons_idx);
     uint32_t cons_idx = READ_ONCE(rq->local_cons_idx);
     if (unlikely(cons_idx == 0xFFFFFFFF) || unlikely(hw_cons_idx == 0xFFFFFFFF)) {
-        fprintf(stderr, "hw_cons_idx=0x%x cons_idx=0x%x\n", hw_cons_idx, cons_idx);
+        printf("hw_cons_idx=0x%x cons_idx=0x%x\n", hw_cons_idx, cons_idx);
         return;
 	}
 
@@ -821,19 +847,19 @@ static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
 		    ptr.hdr.s_mgmt_net.ptr_len != ptr.hdr.s_mgmt_net.ptr_len)) {
 			/* dont handle frags now */
 			rq->errors++;
-            fprintf(stderr, "rq->error increases to %ld due to frags\n", rq->errors);
+            printf("rq->error increases to %ld due to frags\n", rq->errors);
         } else {
             rq->pkts += 1;
 			rq->bytes += ptr.hdr.s_mgmt_net.total_len;
             uint8_t* pktbuf = (uint8_t*)rq->iova_pktbuf + (start * OCTBOOT_NET_RX_BUF_SIZE);
             if (ptr.ptr != (uint64_t)pktbuf) {
-                fprintf(stderr, "ptr.ptr != pktbuf in rxq\n");
+                printf("ptr.ptr != pktbuf in rxq\n");
                 return;
             }
             bytes_sent = send(sock_fd, (uint8_t*)rq->vaddr_pktbuf + (start * OCTBOOT_NET_RX_BUF_SIZE),
                 ptr.hdr.s_mgmt_net.total_len, 0);
             if (bytes_sent != ptr.hdr.s_mgmt_net.total_len) {
-                fprintf(stderr, "Partial send: %zd of %u bytes\n", bytes_sent, ptr.hdr.s_mgmt_net.total_len);
+                printf("Partial send: %zd of %u bytes\n", bytes_sent, ptr.hdr.s_mgmt_net.total_len);
                 return;
             }
         }
@@ -849,7 +875,7 @@ static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
     hw_cons_idx = READ_ONCE(*(uint32_t*)rq->vaddr_cons_idx);
     cons_idx = READ_ONCE(rq->local_cons_idx);
     if (unlikely(cons_idx == 0xFFFFFFFF) || unlikely(hw_cons_idx == 0xFFFFFFFF)) {
-        fprintf(stderr, "hw_cons_idx=0x%x cons_idx=0x%x\n", hw_cons_idx, cons_idx);
+        printf("hw_cons_idx=0x%x cons_idx=0x%x\n", hw_cons_idx, cons_idx);
         return;
 	}
     count = octboot_net_circq_depth(hw_cons_idx,  cons_idx, rq->mask);
@@ -889,7 +915,7 @@ static void veth_handle_rawsock(int sock_fd, octboot_net_device_t* mdev) {
         uint32_t cons_idx = READ_ONCE(*(uint32_t*)tq->vaddr_cons_idx);
         
         if (unlikely(prod_idx == 0xFFFFFFFF) || unlikely(cons_idx == 0xFFFFFFFF)) {
-            fprintf(stderr, "Invalid indices prod_idx=0x%x cons_idx=0x%x\n", 
+            printf("Invalid indices prod_idx=0x%x cons_idx=0x%x\n", 
                     prod_idx, cons_idx);
             break;
         }
@@ -903,7 +929,7 @@ static void veth_handle_rawsock(int sock_fd, octboot_net_device_t* mdev) {
         ssize_t recv_len = recv(sock_fd, pkt_buffer, OCTBOOT_NET_RX_BUF_SIZE, MSG_DONTWAIT);
         if (recv_len < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                fprintf(stderr, "Failed to receive packet: %s\n", strerror(errno));
+                printf("Failed to receive packet: %s\n", strerror(errno));
             }
             break;
         }
@@ -960,7 +986,7 @@ int veth_setup_raw_socket(const char* if_name) {
     // Create RAW socket
     sock_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sock_fd < 0) {
-        fprintf(stderr, "Failed to create raw socket: %s\n", strerror(errno));
+        printf("Failed to create raw socket: %s\n", strerror(errno));
         return -1;
     }
 
@@ -968,7 +994,7 @@ int veth_setup_raw_socket(const char* if_name) {
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, if_name, IFNAMSIZ - 1);
     if (ioctl(sock_fd, SIOCGIFINDEX, &ifr) < 0) {
-        fprintf(stderr, "Failed to get interface index: %s\n", strerror(errno));
+        printf("Failed to get interface index: %s\n", strerror(errno));
         close(sock_fd);
         return -1;
     }
@@ -979,7 +1005,7 @@ int veth_setup_raw_socket(const char* if_name) {
     sll.sll_protocol = htons(ETH_P_ALL);
     sll.sll_ifindex = ifr.ifr_ifindex;
     if (bind(sock_fd, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
-        fprintf(stderr, "Failed to bind socket: %s\n", strerror(errno));
+        printf("Failed to bind socket: %s\n", strerror(errno));
         close(sock_fd);
         return -1;
     }
@@ -988,13 +1014,13 @@ int veth_setup_raw_socket(const char* if_name) {
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, if_name, IFNAMSIZ - 1);
     if (ioctl(sock_fd, SIOCGIFFLAGS, &ifr) < 0) {
-        fprintf(stderr, "Failed to get interface flags: %s\n", strerror(errno));
+        printf("Failed to get interface flags: %s\n", strerror(errno));
         close(sock_fd);
         return -1;
     }
     ifr.ifr_flags |= IFF_PROMISC;
     if (ioctl(sock_fd, SIOCSIFFLAGS, &ifr) < 0) {
-        fprintf(stderr, "Failed to set promiscuous mode: %s\n", strerror(errno));
+        printf("Failed to set promiscuous mode: %s\n", strerror(errno));
         close(sock_fd);
         return -1;
     }
@@ -1121,13 +1147,13 @@ static int find_pcie_cap(octboot_net_device_t* mdev)
 
 void pci_reset_function(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
-        fprintf(stderr, "invalid parameter of mdev\n");
+        printf("invalid parameter of mdev\n");
         return;
     }
 
     int pos = find_pcie_cap(mdev);
     if (pos == 0) {
-        fprintf(stderr, "pcie_cap is not found");
+        printf("pcie_cap is not found");
         return;
     }
 
@@ -1197,7 +1223,7 @@ static int mbox_check_msg_rcvd(octboot_net_device_t* mdev,
     union octboot_net_mbox_msg *msg) {
     int i = 0;
     if (mdev == NULL) {
-        fprintf(stderr, "invalid parameter of mdev\n");
+        printf("invalid parameter of mdev\n");
         return -1;
     }
 
@@ -1217,20 +1243,20 @@ static int handle_target_status(octboot_net_device_t* mdev)
 	int ret = 0;
 	uint64_t host_status = get_host_status(mdev);
 	uint64_t target_status = get_target_status(mdev);
-	fprintf(stderr, "host status %lu\n", host_status);
-	fprintf(stderr, "target status %lu\n", target_status);
+	printf("host status %lu\n", host_status);
+	printf("target status %lu\n", target_status);
 
 	switch (host_status) {
 	case OCTNET_HOST_READY:
 		if (target_status == OCTNET_TARGET_RUNNING) {
-			fprintf(stderr, "octboot_net: target running\n");
+			printf("octboot_net: target running\n");
 			change_host_status(mdev, OCTNET_HOST_RUNNING, false);
 		}
 		break;
 	case OCTNET_HOST_RUNNING:
 		target_status = get_target_status(mdev);
 		if (target_status != OCTNET_TARGET_RUNNING) {
-			fprintf(stderr, "octboot_net: target stopped\n");
+			printf("octboot_net: target stopped\n");
 			change_host_status(mdev, OCTNET_HOST_GOING_DOWN,
 						   false);
             /* reset when txq/rxq running case is not included */
@@ -1247,7 +1273,7 @@ static int handle_target_status(octboot_net_device_t* mdev)
 		}
 		break;
 	default:
-		fprintf(stderr, "octboot_net: unhandled state transition host_status:%lu target_status %lu\n",
+		printf("octboot_net: unhandled state transition host_status:%lu target_status %lu\n",
 		       host_status, target_status);
 		break;
 	}
@@ -1256,7 +1282,7 @@ static int handle_target_status(octboot_net_device_t* mdev)
 
 static int octeon_target_setup(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
-        fprintf(stderr, "invalid parameter of mdev\n");
+        printf("invalid parameter of mdev\n");
         return -1;
     }
 
@@ -1267,9 +1293,9 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
 	writeq(host_version, HOST_VERSION_REG(mdev));
 	uint64_t target_version = get_target_version(mdev);
     if ((host_version >> 8) != (target_version >> 8)) {
-        fprintf(stderr, "octboot_net driver imcompatible with uboot\n");
-        fprintf(stderr, "host_version:0x%lx\n", host_version);
-        fprintf(stderr, "target_version:0x%lx\n", target_version);
+        printf("octboot_net driver imcompatible with uboot\n");
+        printf("host_version:0x%lx\n", host_version);
+        printf("target_version:0x%lx\n", target_version);
         return -1;
     }
 
@@ -1283,7 +1309,7 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
     } else {
         if (mdev->signature_found) {
             mdev->signature_found = false;
-            fprintf(stderr, "signature is found before, but now misaligned with target\n");
+            printf("signature is found before, but now misaligned with target\n");
         }
         return -1;
     }
@@ -1343,8 +1369,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc != 3) {
-        fprintf(stderr, "Usage: %s <vfio_group_id> <pci_addr>\n", argv[0]);
-        fprintf(stderr, "Example: %s 5 0000:b3:00.0\n", argv[0]);
+        printf("Usage: %s <vfio_group_id> <pci_addr>\n", argv[0]);
+        printf("Example: %s 5 0000:b3:00.0\n", argv[0]);
         return -1;
     }
 
@@ -1352,31 +1378,31 @@ int main(int argc, char *argv[]) {
     snprintf(octbootdev[0].pci_addr, sizeof(octbootdev[0].pci_addr), "%s", argv[2]);
 
     while (mdev_mm_init(&octbootdev[0]) < 0) {
-        fprintf(stderr, "failed to init vfio\n");
+        printf("failed to init vfio\n");
         usleep(INIT_SLEEP_US);
     }
-    fprintf(stderr, "vfio is initiated successfully\n");
+    printf("vfio is initiated successfully\n");
 
     while (octeon_target_setup(&octbootdev[0]) < 0) {
-        fprintf(stderr, "failed to setup target\n");
+        printf("failed to setup target\n");
         usleep(INIT_SLEEP_US);
     }
-    fprintf(stderr, "octeon target comes up\n");
+    printf("octeon target comes up\n");
 
     if (mdev_dma_init(&octbootdev[0]) < 0) {
-        fprintf(stderr, "failed to init dma\n");
+        printf("failed to init dma\n");
         return -1;
     }
 
     if (mdev_setup_rx_ring(&octbootdev[0]) < 0) {
-        fprintf(stderr, "failed to setup rx ring\n");
+        printf("failed to setup rx ring\n");
         mdev_clean_rx_ring(&octbootdev[0]);
         mdev_mm_uninit(&octbootdev[0]);
         return -1;
     }
 
     if (mdev_setup_tx_ring(&octbootdev[0]) < 0) {
-        fprintf(stderr, "failed to setup tx ring\n");
+        printf("failed to setup tx ring\n");
         mdev_clean_rx_ring(&octbootdev[0]);
         mdev_clean_tx_ring(&octbootdev[0]);
         mdev_mm_uninit(&octbootdev[0]);
@@ -1386,7 +1412,7 @@ int main(int argc, char *argv[]) {
 #if 0
     int veth_fd = veth_setup_raw_socket(VETH_INTERFACE_NAME);
     if (veth_fd < 0) {
-        fprintf(stderr, "failed to setup veth\n");
+        printf("failed to setup veth\n");
         mdev_clean_rx_ring(&octbootdev[0]);
         mdev_clean_tx_ring(&octbootdev[0]);
         mdev_mm_uninit(&octbootdev[0]);
@@ -1399,14 +1425,14 @@ int main(int argc, char *argv[]) {
     params.mdev = &octbootdev[0];
     params.veth_fd = -1;
     if (pthread_create(&octeon_thread, NULL, octeon_thread_func, &params) != 0) {
-        fprintf(stderr, "failed to create octeon thread\n");
+        printf("failed to create octeon thread\n");
         mdev_clean_rx_ring(&octbootdev[0]);
         mdev_clean_tx_ring(&octbootdev[0]);
         mdev_mm_uninit(&octbootdev[0]);
         return -1;
     }
     if (pthread_create(&veth_thread, NULL, veth_thread_func, &params) != 0) {
-        fprintf(stderr, "failed to create veth thread\n");
+        printf("failed to create veth thread\n");
         mdev_clean_rx_ring(&octbootdev[0]);
         mdev_clean_tx_ring(&octbootdev[0]);
         mdev_mm_uninit(&octbootdev[0]);

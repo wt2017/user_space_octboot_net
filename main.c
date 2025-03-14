@@ -466,14 +466,9 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
     char path[256];
     for (int i=0; i<NUM_BARS; i++) {
         snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource%d", mdev->pci_addr, i*2);
-        mdev->bar_map[i].fd = open(path, O_RDONLY);
+        mdev->bar_map[i].fd = open(path, O_RDWR | O_SYNC);
         if (mdev->bar_map[i].fd < 0) {
             fprintf(stderr, "failed to open device config file:%s\n", path);
-            return -1;
-        }
-
-        if((mdev->bar_map[i].fd = open(path, O_RDWR | O_SYNC)) < 0) {
-            fprintf(stderr, "failed to open %s\n", path);
             return -1;
         }
 
@@ -492,7 +487,12 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
             return -1;
         }
 
-        mdev->bar_map[i].bar_addr = mmap(0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->bar_map[i].fd, 0);
+        off_t target = 0;
+        off_t target_base = target & ~(sysconf(_SC_PAGE_SIZE)-1);
+        mdev->bar_map[i].bar_size = target + mdev->bar_map[i].bar_size - target_base;
+        printf("mmap(%d, %d, 0x%x, 0x%x, %d, 0x%x)\n", 0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->bar_map[i].fd, (int) target);
+        mdev->bar_map[i].bar_addr = mmap(0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->bar_map[i].fd, target);
+        fprintf(stderr, "bar%d addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
     }
 
 #if 0
@@ -738,7 +738,7 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         fprintf(stderr, "invalid parameter of mdev\n");
         return -1;
     }
-
+#if 0
     mdev->container_fd = open("/dev/vfio/vfio", O_RDWR);
     if (mdev->container_fd < 0) {
         fprintf(stderr, "failed to open vfio container\n");
@@ -772,6 +772,7 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         return -1;
     }
     fprintf(stderr, "device_fd=0x%x\n", mdev->device_fd);
+#endif
 #if 0
     if (mdev_conf_map(mdev) < 0) {
         fprintf(stderr, "failed to map conf\n");

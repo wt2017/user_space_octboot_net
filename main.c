@@ -129,6 +129,7 @@ typedef struct {
     int bar_size;
     off_t offset;
     bool iobar;
+    __u32 bar_flags;
 } bar_map_t;
 
 typedef struct {
@@ -563,12 +564,14 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
             return -1;
         }
 
-        bool iobar = pci_vfio_is_ioport_bar(mdev, i);
-        printf("bar%d region info, offset=0x%llx, size=%llu, iobar=%d\n", i*2, reg.offset, reg.size, iobar);
+        bool iobar = pci_vfio_is_ioport_bar(mdev, i*2);
+        bool mappable = (reg.flags & VFIO_REGION_INFO_FLAG_MMAP) != 0;
+        printf("bar%d region info, offset=0x%llx, size=%llu, iobar=%d, mappable=%d\n", i*2, reg.offset, reg.size, iobar, mappable);
 
         mdev->bar_map[i].bar_size = reg.size;
         mdev->bar_map[i].offset = reg.offset;
         mdev->bar_map[i].iobar = iobar;
+        mdev->bar_map[i].bar_flags = reg.flags;
 
         if (i==BAR4) {
             uint64_t buffer;

@@ -488,7 +488,7 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
         printf("invalid parameter of mdev\n");
         return -1;
     }
-
+#if 0
     char path[256];
     for (int i=0; i<NUM_BARS; i++) {
         snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource%d", mdev->pci_addr, i*2);
@@ -520,8 +520,8 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
         mdev->bar_map[i].bar_addr = mmap(0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->bar_map[i].fd, target);
         printf("bar%d addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
     }
-
-#if 0
+#endif
+//#if 0
     for (int i = 0; i < NUM_BARS; i++) {
         struct vfio_region_info reg = {
             .argsz = sizeof(reg),
@@ -535,7 +535,14 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
         printf("bar%d region info, offset=0x%llx, size=%llu\n", i*2, reg.offset, reg.size);
 
         mdev->bar_map[i].bar_size = reg.size;
+        if (i==BAR4) {
+            uint64_t buffer;
+            off_t asb_offset = reg.offset + 0x2000060;
+            ssize_t bytes = pread(mdev->device_fd, &buffer, sizeof(uint64_t), asb_offset);
+            printf("bytes=%ld, buffer=0x%lx\n", bytes, buffer);
+        }
 
+#if 0
         mdev->bar_map[i].bar_addr = mmap(NULL, reg.size, 
             PROT_READ | PROT_WRITE,
             MAP_SHARED,  // Note: should be MAP_SHARED not MAP_PRIVATE
@@ -548,8 +555,9 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
         }
 
         printf("bar%d addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
-    }
 #endif
+    }
+//#endif
     return 0;
 }
 
@@ -764,7 +772,7 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         printf("invalid parameter of mdev\n");
         return -1;
     }
-#if 0
+//#if 0
     mdev->container_fd = open("/dev/vfio/vfio", O_RDWR);
     if (mdev->container_fd < 0) {
         printf("failed to open vfio container\n");
@@ -798,7 +806,7 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         return -1;
     }
     printf("device_fd=0x%x\n", mdev->device_fd);
-#endif
+//#endif
 #if 0
     if (mdev_conf_map(mdev) < 0) {
         printf("failed to map conf\n");
@@ -1382,7 +1390,7 @@ int main(int argc, char *argv[]) {
         usleep(INIT_SLEEP_US);
     }
     printf("vfio is initiated successfully\n");
-
+#if 0
     while (octeon_target_setup(&octbootdev[0]) < 0) {
         printf("failed to setup target\n");
         usleep(INIT_SLEEP_US);
@@ -1441,5 +1449,6 @@ int main(int argc, char *argv[]) {
 
     pthread_join(octeon_thread, NULL);
     pthread_join(veth_thread, NULL);
+#endif
     return ret;
 }

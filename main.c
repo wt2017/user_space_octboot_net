@@ -80,6 +80,10 @@
 #define likely(x)      __builtin_expect(!!(x), 1)
 #define unlikely(x)    __builtin_expect(!!(x), 0)
 
+// dpdk logic
+#define RTE_PCI_BASE_ADDRESS_0	0x10
+#define RTE_PCI_BASE_ADDRESS_SPACE_IO	0x01
+
 struct octboot_net_mbox_hdr {
 	uint64_t opcode  :8;
 	uint64_t id      :8;
@@ -123,12 +127,15 @@ typedef struct {
     uint64_t phy_bar_addr;
     void* bar_addr;
     int bar_size;
+    off_t offset;
+    bool iobar;
 } bar_map_t;
 
 typedef struct {
     int fd;
     void* conf_addr;
     int conf_size;
+    off_t conf_offset;
 } conf_map_t;
 
 struct uboot_pcinet_barmap {
@@ -438,7 +445,7 @@ int mdev_get_phy_addr(octboot_net_device_t* mdev) {
 }
 
 int mdev_conf_map(octboot_net_device_t* mdev) {
-
+#if 0
     char path[256];
     snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/config", mdev->pci_addr);
     mdev->conf_map.fd = open(path, O_RDWR | O_SYNC);
@@ -454,8 +461,8 @@ int mdev_conf_map(octboot_net_device_t* mdev) {
     printf("mmap(%d, %d, 0x%x, 0x%x, %d, 0x%x)\n", 0, mdev->conf_map.conf_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->conf_map.fd, (int) target);
     mdev->conf_map.conf_addr = mmap(0, mdev->conf_map.conf_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->conf_map.fd, target);
     printf("conf addr=%p\n", mdev->conf_map.conf_addr);
+#endif
 
-#if 0
     struct vfio_region_info reg = {
         .argsz = sizeof(reg),
         .index = VFIO_PCI_CONFIG_REGION_INDEX
@@ -468,6 +475,9 @@ int mdev_conf_map(octboot_net_device_t* mdev) {
     printf("conf region info, offset=0x%llx, size=%llu\n", reg.offset, reg.size);
 
     mdev->conf_map.conf_size = reg.size;
+    mdev->conf_map.conf_offset = reg.offset;
+
+#if 0
     mdev->conf_map.conf_addr = mmap(NULL, reg.size, 
         PROT_READ | PROT_WRITE,
         //PROT_READ,
@@ -481,6 +491,26 @@ int mdev_conf_map(octboot_net_device_t* mdev) {
     }
 #endif
     return 0;
+}
+
+bool pci_vfio_is_ioport_bar(octboot_net_device_t* mdev,
+	int bar_index)
+{
+	uint32_t ioport_bar;
+	int ret = pread(mdev->device_fd, &ioport_bar, sizeof(ioport_bar),
+			  mdev->conf_map.conf_offset + RTE_PCI_BASE_ADDRESS_0 + bar_index * 4);
+	if (ret != sizeof(ioport_bar)) {
+		printf("Cannot read command (%x) from config space!",
+			RTE_PCI_BASE_ADDRESS_0 + bar_index*4);
+		return false;
+	}
+
+    if ((ioport_bar & RTE_PCI_BASE_ADDRESS_SPACE_IO) != 0) {
+        printf("BAR%d is IO port\n", bar_index);
+        return true;
+    }
+
+	return false;
 }
 
 int mdev_bar_map(octboot_net_device_t* mdev) {
@@ -532,9 +562,14 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
             mdev_mm_uninit(mdev);
             return -1;
         }
-        printf("bar%d region info, offset=0x%llx, size=%llu\n", i*2, reg.offset, reg.size);
+
+        bool iobar = pci_vfio_is_ioport_bar(mdev, i);
+        printf("bar%d region info, offset=0x%llx, size=%llu, iobar=%d\n", i*2, reg.offset, reg.size, iobar);
 
         mdev->bar_map[i].bar_size = reg.size;
+        mdev->bar_map[i].offset = reg.offset;
+        mdev->bar_map[i].iobar = iobar;
+
         if (i==BAR4) {
             uint64_t buffer;
             off_t asb_offset = reg.offset + 0x2000060;
@@ -772,7 +807,7 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         printf("invalid parameter of mdev\n");
         return -1;
     }
-//#if 0
+
     mdev->container_fd = open("/dev/vfio/vfio", O_RDWR);
     if (mdev->container_fd < 0) {
         printf("failed to open vfio container\n");
@@ -806,14 +841,12 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         return -1;
     }
     printf("device_fd=0x%x\n", mdev->device_fd);
-//#endif
-#if 0
+
     if (mdev_conf_map(mdev) < 0) {
         printf("failed to map conf\n");
         mdev_mm_uninit(mdev);
         return -1;
     }
-#endif
 
     if (mdev_bar_map(mdev) < 0) {
         printf("failed to map bars\n");

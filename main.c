@@ -85,6 +85,20 @@
 #define RTE_PCI_BASE_ADDRESS_SPACE_IO	0x01
 #define VFIO_CAP_OFFSET(x) (x->cap_offset)
 #define RTE_PTR_ADD(ptr, x) ((void*)((uintptr_t)(ptr) + (x)))
+#define RTE_PCI_CAPABILITY_LIST	0x34
+#define RTE_PCI_CAP_ID_MSIX		0x11
+#define RTE_PCI_CAP_SIZEOF		4
+#define RTE_PCI_CAP_NEXT		1
+#define RTE_PCI_CFG_SPACE_SIZE		256
+#define RTE_PCI_CFG_SPACE_EXP_SIZE	4096
+#define RTE_PCI_STD_HEADER_SIZEOF	64
+#define RTE_PCI_MSIX_FLAGS		2	/* Message Control */
+#define RTE_PCI_MSIX_FLAGS_QSIZE	0x07ff	/* Table size */
+#define RTE_PCI_MSIX_FLAGS_MASKALL	0x4000	/* Mask all vectors for this function */
+#define RTE_PCI_MSIX_FLAGS_ENABLE	0x8000	/* MSI-X enable */
+#define RTE_PCI_MSIX_TABLE		4	/* Table offset */
+#define RTE_PCI_MSIX_TABLE_BIR		0x00000007 /* BAR index */
+#define RTE_PCI_MSIX_TABLE_OFFSET	0xfffffff8 /* Offset into specified BAR */
 
 struct octboot_net_mbox_hdr {
 	uint64_t opcode  :8;
@@ -128,8 +142,8 @@ typedef struct {
     int fd;
     uint64_t phy_bar_addr;
     void* bar_addr;
-    int bar_size;
-    off_t offset;
+    uint64_t bar_size;
+    uint64_t offset;
     bool iobar;
     __u32 bar_flags;
 } bar_map_t;
@@ -137,8 +151,8 @@ typedef struct {
 typedef struct {
     int fd;
     void* conf_addr;
-    int conf_size;
-    off_t conf_offset;
+    uint64_t conf_size;
+    uint64_t conf_offset;
 } conf_map_t;
 
 struct uboot_pcinet_barmap {
@@ -155,6 +169,12 @@ struct uboot_pcinet_barmap {
 	uint64_t tx_descriptor_offset;
 };
 
+struct pci_msix_table {
+	int bar_index;
+	uint32_t offset;
+	uint32_t size;
+};
+
 typedef struct {
     char vfio_path[32];
     char pci_addr[32];
@@ -166,6 +186,7 @@ typedef struct {
     uint32_t send_mbox_id;
 	uint32_t recv_mbox_id;
     conf_map_t conf_map;
+    struct pci_msix_table msix_table;
     bar_map_t bar_map[NUM_BARS];
     struct octboot_net_sw_descq rxq[OCTBOOT_NET_MAXQ];
 	struct octboot_net_sw_descq txq[OCTBOOT_NET_MAXQ];
@@ -516,6 +537,59 @@ bool pci_vfio_is_ioport_bar(octboot_net_device_t* mdev,
 	return false;
 }
 
+int
+pci_vfio_read_config(octboot_net_device_t* mdev,
+		    void *buf, size_t len, off_t offs)
+{
+	if ((uint64_t)len + offs > mdev->conf_map.conf_size)
+		return -1;
+
+	return pread(mdev->device_fd, buf, len, mdev->conf_map.conf_offset + offs);
+}
+
+off_t
+pci_find_next_capability(octboot_net_device_t* mdev, uint8_t cap,
+	off_t offset)
+{
+	uint8_t pos;
+	int ttl;
+
+	if (offset == 0)
+		offset = RTE_PCI_CAPABILITY_LIST;
+	else
+		offset += RTE_PCI_CAP_NEXT;
+	ttl = (RTE_PCI_CFG_SPACE_SIZE - RTE_PCI_STD_HEADER_SIZEOF) / RTE_PCI_CAP_SIZEOF;
+
+	if (pci_vfio_read_config(mdev, &pos, sizeof(pos), offset) < 0)
+		return -1;
+
+	while (pos && ttl--) {
+		uint16_t ent;
+		uint8_t id;
+
+		offset = pos;
+		if (pci_vfio_read_config(mdev, &ent, sizeof(ent), offset) < 0)
+			return -1;
+
+		id = ent & 0xff;
+		if (id == 0xff)
+			break;
+
+		if (id == cap)
+			return offset;
+
+		pos = (ent >> 8);
+	}
+
+	return 0;
+}
+
+off_t
+pci_find_capability(octboot_net_device_t* mdev, uint8_t cap)
+{
+	return pci_find_next_capability(mdev, cap, 0);
+}
+
 static struct vfio_info_cap_header *
 pci_vfio_info_cap(struct vfio_region_info* info, int cap)
 {
@@ -523,7 +597,7 @@ pci_vfio_info_cap(struct vfio_region_info* info, int cap)
 	size_t offset;
 
 	if ((info->flags & VFIO_REGION_INFO_FLAG_CAPS) == 0) {
-		/* VFIO info does not advertise capabilities */
+		printf("VFIO info does not advertise capabilities)\n");
 		return NULL;
 	}
 
@@ -535,6 +609,40 @@ pci_vfio_info_cap(struct vfio_region_info* info, int cap)
 		offset = h->next;
 	}
 	return NULL;
+}
+
+static int
+pci_vfio_get_msix_bar(octboot_net_device_t* mdev,
+	struct pci_msix_table* msix_table)
+{
+	off_t cap_offset = pci_find_capability(mdev, RTE_PCI_CAP_ID_MSIX);
+	if (cap_offset < 0)
+		return -1;
+
+	if (cap_offset != 0) {
+		uint16_t flags;
+		uint32_t reg;
+
+		if (pci_vfio_read_config(mdev, &reg, sizeof(reg), cap_offset +
+				RTE_PCI_MSIX_TABLE) < 0) {
+			printf("Cannot read MSIX table from PCI config space!");
+			return -1;
+		}
+
+		if (pci_vfio_read_config(mdev, &flags, sizeof(flags), cap_offset +
+				RTE_PCI_MSIX_FLAGS) < 0) {
+			printf("Cannot read MSIX flags from PCI config space!");
+			return -1;
+		}
+
+		msix_table->bar_index = reg & RTE_PCI_MSIX_TABLE_BIR;
+		msix_table->offset = reg & RTE_PCI_MSIX_TABLE_OFFSET;
+		msix_table->size = 16 * (1 + (flags & RTE_PCI_MSIX_FLAGS_QSIZE));
+        printf("msix_table: bar_index=%d, offset=0x%x, size=%d\n",
+            msix_table->bar_index, msix_table->offset, msix_table->size);
+	}
+
+	return 0;
 }
 
 int mdev_bar_map(octboot_net_device_t* mdev) {
@@ -576,6 +684,12 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
     }
 #endif
 //#if 0
+    if (pci_vfio_get_msix_bar(mdev, &mdev->msix_table) < 0) {
+        printf("failed to get msix bar\n");
+        mdev_mm_uninit(mdev);
+        return -1;
+    }
+
     for (int i = 0; i < NUM_BARS; i++) {
         struct vfio_region_info reg = {
             .argsz = sizeof(reg),
@@ -590,8 +704,9 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
         bool iobar = pci_vfio_is_ioport_bar(mdev, i*2);
         bool mappable = (reg.flags & VFIO_REGION_INFO_FLAG_MMAP) != 0;
         struct vfio_info_cap_header* hdr = pci_vfio_info_cap(&reg, VFIO_REGION_INFO_CAP_SPARSE_MMAP);
-        printf("bar%d region info, offset=0x%llx, size=%llu, iobar=%d, mappable=%d, hdr=%p\n", 
-            i*2, reg.offset, reg.size, iobar, mappable, (void*)hdr);
+        bool sparse = hdr != NULL;
+        printf("bar%d region info, offset=0x%llx, size=%llu, iobar=%d, mappable=%d, sparse=%d\n", 
+            i*2, reg.offset, reg.size, iobar, mappable, sparse);
 
         mdev->bar_map[i].bar_size = reg.size;
         mdev->bar_map[i].offset = reg.offset;

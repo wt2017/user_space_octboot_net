@@ -83,6 +83,8 @@
 // dpdk logic
 #define RTE_PCI_BASE_ADDRESS_0	0x10
 #define RTE_PCI_BASE_ADDRESS_SPACE_IO	0x01
+#define VFIO_CAP_OFFSET(x) (x->cap_offset)
+#define RTE_PTR_ADD(ptr, x) ((void*)((uintptr_t)(ptr) + (x)))
 
 struct octboot_net_mbox_hdr {
 	uint64_t opcode  :8;
@@ -514,6 +516,27 @@ bool pci_vfio_is_ioport_bar(octboot_net_device_t* mdev,
 	return false;
 }
 
+static struct vfio_info_cap_header *
+pci_vfio_info_cap(struct vfio_region_info* info, int cap)
+{
+	struct vfio_info_cap_header *h;
+	size_t offset;
+
+	if ((info->flags & VFIO_REGION_INFO_FLAG_CAPS) == 0) {
+		/* VFIO info does not advertise capabilities */
+		return NULL;
+	}
+
+	offset = VFIO_CAP_OFFSET(info);
+	while (offset != 0) {
+		h = RTE_PTR_ADD(info, offset);
+		if (h->id == cap)
+			return h;
+		offset = h->next;
+	}
+	return NULL;
+}
+
 int mdev_bar_map(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         printf("invalid parameter of mdev\n");
@@ -566,7 +589,9 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
 
         bool iobar = pci_vfio_is_ioport_bar(mdev, i*2);
         bool mappable = (reg.flags & VFIO_REGION_INFO_FLAG_MMAP) != 0;
-        printf("bar%d region info, offset=0x%llx, size=%llu, iobar=%d, mappable=%d\n", i*2, reg.offset, reg.size, iobar, mappable);
+        struct vfio_info_cap_header* hdr = pci_vfio_info_cap(&reg, VFIO_REGION_INFO_CAP_SPARSE_MMAP);
+        printf("bar%d region info, offset=0x%llx, size=%llu, iobar=%d, mappable=%d, hdr=%p\n", 
+            i*2, reg.offset, reg.size, iobar, mappable, (void*)hdr);
 
         mdev->bar_map[i].bar_size = reg.size;
         mdev->bar_map[i].offset = reg.offset;

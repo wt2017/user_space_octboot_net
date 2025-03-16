@@ -1518,7 +1518,7 @@ pci_vfio_enable_bus_memory(octboot_net_device_t* mdev)
 
 	int ret = pread(mdev->container_fd, &cmd, sizeof(cmd), mdev->conf_map.conf_offset + RTE_PCI_COMMAND);
 	if (ret != sizeof(cmd)) {
-		printf("Cannot read command from PCI config space!");
+		printf("Cannot read command from PCI config space!\n");
 		return -1;
 	}
 
@@ -1530,7 +1530,7 @@ pci_vfio_enable_bus_memory(octboot_net_device_t* mdev)
 	cmd |= RTE_PCI_COMMAND_MEMORY;
 	ret = pwrite(mdev->container_fd, &cmd, sizeof(cmd), mdev->conf_map.conf_offset + RTE_PCI_COMMAND);
 	if (ret != sizeof(cmd)) {
-		printf("Cannot write command to PCI config space!");
+		printf("Cannot write command to PCI config space!\n");
 		return -1;
 	}
 
@@ -1542,11 +1542,18 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
         printf("invalid parameter of mdev\n");
         return -1;
     }
-
-    // pci_reset_function(mdev);
-    // pci_enable_device(mdev);
+#if 0
+    pci_reset_function(mdev);
+    pci_enable_device(mdev);
+#endif
+#if 0
     if (pci_vfio_enable_bus_memory(mdev)) {
         printf("failed to enable bus memory\n");
+        return -1;
+    }
+#endif
+    if (ioctl(mdev->container_fd, VFIO_DEVICE_RESET)) {
+        printf("Unable to reset device! Error: %d (%s)", errno, strerror(errno));
         return -1;
     }
 

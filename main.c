@@ -99,6 +99,26 @@
 #define RTE_PCI_MSIX_TABLE		4	/* Table offset */
 #define RTE_PCI_MSIX_TABLE_BIR		0x00000007 /* BAR index */
 #define RTE_PCI_MSIX_TABLE_OFFSET	0xfffffff8 /* Offset into specified BAR */
+enum rte_map_flags {
+	/** Changes to the mapped memory are visible to other processes. */
+	RTE_MAP_SHARED = 1 << 0,
+	/** Mapping is not backed by a regular file. */
+	RTE_MAP_ANONYMOUS = 1 << 1,
+	/** Copy-on-write mapping, changes are invisible to other processes. */
+	RTE_MAP_PRIVATE = 1 << 2,
+	/**
+	 * Force mapping to the requested address. This flag should be used
+	 * with caution, because to fulfill the request implementation
+	 * may remove all other mappings in the requested region. However,
+	 * it is not required to do so, thus mapping with this flag may fail.
+	 */
+	RTE_MAP_FORCE_ADDRESS = 1 << 3
+};
+enum rte_mem_prot {
+	RTE_PROT_READ = 1 << 0,   /**< Read access. */
+	RTE_PROT_WRITE = 1 << 1,  /**< Write access. */
+	RTE_PROT_EXECUTE = 1 << 2 /**< Code execution. */
+};
 
 struct octboot_net_mbox_hdr {
 	uint64_t opcode  :8;
@@ -683,7 +703,7 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
         printf("bar%d addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
     }
 #endif
-//#if 0
+
     if (pci_vfio_get_msix_bar(mdev, &mdev->msix_table) < 0) {
         printf("failed to get msix bar\n");
         mdev_mm_uninit(mdev);
@@ -691,6 +711,10 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
     }
 
     for (int i = 0; i < NUM_BARS; i++) {
+        if (i*2 == mdev->msix_table.bar_index) {
+            continue;
+        }
+
         struct vfio_region_info reg = {
             .argsz = sizeof(reg),
             .index = VFIO_PCI_BAR0_REGION_INDEX + (i * 2) // BAR0, BAR2, BAR4
@@ -712,13 +736,14 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
         mdev->bar_map[i].offset = reg.offset;
         mdev->bar_map[i].iobar = iobar;
         mdev->bar_map[i].bar_flags = reg.flags;
-
+#if 0
         if (i==BAR4) {
             uint64_t buffer;
             off_t asb_offset = reg.offset + 0x2000060;
             ssize_t bytes = pread(mdev->device_fd, &buffer, sizeof(uint64_t), asb_offset);
             printf("bytes=%ld, buffer=0x%lx\n", bytes, buffer);
         }
+#endif
 
 #if 0
         mdev->bar_map[i].bar_addr = mmap(NULL, reg.size, 
@@ -731,11 +756,27 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
             mdev_mm_uninit(mdev);
             return -1;
         }
-
-        printf("bar%d addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
 #endif
+        void* bar_addr = mmap(0, mdev->bar_map[i].bar_size, 0, MAP_PRIVATE |
+        MAP_ANONYMOUS, -1, 0);
+        if (bar_addr == MAP_FAILED) {
+            printf("failed to map vaddr of bar %d\n", i*2);
+            return -1;
+        }
+        printf("bar%d bar_addr=%p\n", i*2, bar_addr);
+
+        void* map_addr = mmap(bar_addr, mdev->bar_map[i].bar_size,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_FIXED, mdev->device_fd, mdev->bar_map[i].offset);
+        if (map_addr == NULL) {
+            printf("failed to map paddr of bar %d\n", i*2);
+            return -1;
+        }
+        printf("bar%d map_addr=%p\n", i*2, map_addr);
+
+        mdev->bar_map[i].bar_addr = map_addr;
     }
-//#endif
+
     return 0;
 }
 

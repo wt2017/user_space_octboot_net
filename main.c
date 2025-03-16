@@ -762,7 +762,7 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
             return -1;
         }
 #endif
-        void* bar_addr = mmap(0, mdev->bar_map[i].bar_size, 0, MAP_PRIVATE |
+        void* bar_addr = mmap(0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_PRIVATE |
         MAP_ANONYMOUS, -1, 0);
         if (bar_addr == MAP_FAILED) {
             printf("failed to map vaddr of bar %d\n", i*2);
@@ -773,8 +773,9 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
         void* map_addr = mmap(bar_addr, mdev->bar_map[i].bar_size,
             PROT_READ | PROT_WRITE,
             MAP_SHARED | MAP_FIXED, mdev->device_fd, mdev->bar_map[i].offset);
-        if (map_addr == NULL) {
+        if (map_addr == MAP_FAILED) {
             printf("failed to map paddr of bar %d\n", i*2);
+            munmap(bar_addr, mdev->bar_map[i].bar_size); 
             return -1;
         }
         printf("bar%d map_addr=%p\n", i*2, map_addr);

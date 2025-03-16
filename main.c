@@ -99,6 +99,11 @@
 #define RTE_PCI_MSIX_TABLE		4	/* Table offset */
 #define RTE_PCI_MSIX_TABLE_BIR		0x00000007 /* BAR index */
 #define RTE_PCI_MSIX_TABLE_OFFSET	0xfffffff8 /* Offset into specified BAR */
+#define RTE_PCI_COMMAND		0x04
+#define RTE_PCI_COMMAND_MEMORY		0x2	/* Enable response in Memory space */
+#define RTE_PCI_COMMAND_MASTER		0x4	/* Bus Master Enable */
+#define RTE_PCI_COMMAND_INTX_DISABLE	0x400	/* INTx Emulation Disable */
+
 enum rte_map_flags {
 	/** Changes to the mapped memory are visible to other processes. */
 	RTE_MAP_SHARED = 1 << 0,
@@ -1505,6 +1510,33 @@ static int handle_target_status(octboot_net_device_t* mdev)
 	return ret;
 }
 
+static int
+pci_vfio_enable_bus_memory(octboot_net_device_t* mdev)
+{
+	uint16_t cmd;
+
+
+	int ret = pread(mdev->container_fd, &cmd, sizeof(cmd), mdev->conf_map.conf_offset + RTE_PCI_COMMAND);
+	if (ret != sizeof(cmd)) {
+		printf("Cannot read command from PCI config space!");
+		return -1;
+	}
+
+	if (cmd & RTE_PCI_COMMAND_MEMORY) {
+        printf("Memory already enabled\n");
+        return 0;
+    }
+
+	cmd |= RTE_PCI_COMMAND_MEMORY;
+	ret = pwrite(mdev->container_fd, &cmd, sizeof(cmd), mdev->conf_map.conf_offset + RTE_PCI_COMMAND);
+	if (ret != sizeof(cmd)) {
+		printf("Cannot write command to PCI config space!");
+		return -1;
+	}
+
+	return 0;
+}
+
 static int octeon_target_setup(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         printf("invalid parameter of mdev\n");
@@ -1513,6 +1545,10 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
 
     // pci_reset_function(mdev);
     // pci_enable_device(mdev);
+    if (pci_vfio_enable_bus_memory(mdev)) {
+        printf("failed to enable bus memory\n");
+        return -1;
+    }
 
     uint64_t host_version = ((OCTBOOT_NET_VERSION_MAJOR << 8)|OCTBOOT_NET_VERSION_MINOR);
 	writeq(host_version, HOST_VERSION_REG(mdev));
@@ -1607,13 +1643,13 @@ int main(int argc, char *argv[]) {
         usleep(INIT_SLEEP_US);
     }
     printf("vfio is initiated successfully\n");
-#if 0
+
     while (octeon_target_setup(&octbootdev[0]) < 0) {
         printf("failed to setup target\n");
         usleep(INIT_SLEEP_US);
     }
     printf("octeon target comes up\n");
-
+#if 0
     if (mdev_dma_init(&octbootdev[0]) < 0) {
         printf("failed to init dma\n");
         return -1;

@@ -1004,6 +1004,12 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         return -1;
     }
 
+    if (ioctl(mdev->container_fd, VFIO_GET_API_VERSION) != VFIO_API_VERSION) {
+        printf("VFIO API version mismatch\n");
+        mdev_mm_uninit(mdev);
+        return -1;
+    }
+
     mdev->group_fd = open(mdev->vfio_path, O_RDWR);
     if (mdev->group_fd < 0) {
         printf("failed to open vfio group\n");
@@ -1011,8 +1017,27 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         return -1;
     }
 
+    struct vfio_group_status group_status = {.argsz = sizeof(group_status)};
+    if (ioctl(mdev->group_fd, VFIO_GROUP_GET_STATUS, &group_status) < 0) {
+        printf("Failed to get VFIO group status\n");
+        mdev_mm_uninit(mdev);
+        return -1;
+    }
+
+    if (!(group_status.flags & VFIO_GROUP_FLAGS_VIABLE)) {
+        printf("VFIO group is not viable (all devices bound to vfio-pci)\n");
+        mdev_mm_uninit(mdev);
+        return -1;
+    }
+
     if (ioctl(mdev->group_fd, VFIO_GROUP_SET_CONTAINER, &mdev->container_fd)) {
         printf("failed to bind vfio group to vfio container\n");
+        mdev_mm_uninit(mdev);
+        return -1;
+    }
+
+    if (ioctl(mdev->container_fd, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU) <= 0) {
+        printf("VFIO Type1 IOMMU not supported\n"); 
         mdev_mm_uninit(mdev);
         return -1;
     }

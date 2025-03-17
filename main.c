@@ -80,6 +80,25 @@
 #define likely(x)      __builtin_expect(!!(x), 1)
 #define unlikely(x)    __builtin_expect(!!(x), 0)
 
+/***********************************     pci_regs.h   ***************************************
+#define PCI_VENDOR_ID		0x00
+#define PCI_DEVICE_ID		0x02
+#define PCI_COMMAND		0x04
+#define  PCI_COMMAND_IO		0x1
+#define  PCI_COMMAND_MEMORY	0x2
+#define  PCI_COMMAND_MASTER	0x4
+
+#define PCI_CAPABILITY_LIST	0x34
+#define PCI_EXP_DEVCTL		0x08
+********************************************************************************************/
+#define VFIO_PCI_CONFIG_REGION_SIZE 256
+#define PCI_VENDOR_ID		0x00
+#define PCI_DEVICE_ID   0x02	/* 16 bits */
+#define PCI_COMMAND     0x04	/* 16 bits */
+#define PCI_COMMAND_MEMORY 0x2	/* Enable response in Memory space */
+#define PCI_COMMAND_MASTER 0x4	/* Enable bus mastering */
+#define PCI_REVISION_ID		0x08
+
 // dpdk logic
 #define RTE_PCI_BASE_ADDRESS_0	0x10
 #define RTE_PCI_BASE_ADDRESS_SPACE_IO	0x01
@@ -622,7 +641,7 @@ pci_vfio_info_cap(struct vfio_region_info* info, int cap)
 	size_t offset;
 
 	if ((info->flags & VFIO_REGION_INFO_FLAG_CAPS) == 0) {
-		printf("VFIO info does not advertise capabilities)\n");
+		printf("VFIO info does not advertise capabilities\n");
 		return NULL;
 	}
 
@@ -762,6 +781,8 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
             return -1;
         }
 #endif
+
+#if 0
         void* bar_addr = mmap(0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_PRIVATE |
         MAP_ANONYMOUS, -1, 0);
         if (bar_addr == MAP_FAILED) {
@@ -779,8 +800,8 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
             return -1;
         }
         printf("bar%d map_addr=%p\n", i*2, map_addr);
-
         mdev->bar_map[i].bar_addr = map_addr;
+#endif
     }
 
     return 0;
@@ -992,6 +1013,52 @@ int mdev_dma_init(octboot_net_device_t* mdev) {
     return 0;
 }
 
+static int vfio_read(int fd, void *buf, ssize_t len, off_t off)
+{
+	if (pread(fd, buf, len, off) != len) {
+		printf("pread(off=%#lx len=%lu)", off, len);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int vfio_write(int fd, void *buf, ssize_t len, off_t off)
+{
+	if (pwrite(fd, buf, len, off) != len) {
+		printf("pwrite(off=%#lx len=%lu)", off, len);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int
+pci_vfio_enable_bus_memory(octboot_net_device_t* mdev)
+{
+	uint16_t cmd;
+    if (vfio_read(mdev->device_fd, &cmd,
+            sizeof(cmd), mdev->conf_map.conf_offset + PCI_COMMAND)) {
+                printf("pread fd[%d] cmd[%d] offset[0x%lx] error\n", mdev->device_fd, cmd, mdev->conf_map.conf_offset + PCI_COMMAND);
+                return -1;
+            }
+
+    cmd |= PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY;
+    if (vfio_write(mdev->device_fd, &cmd,
+            sizeof(cmd), mdev->conf_map.conf_offset + PCI_COMMAND)) {
+                printf("pread fd[%d] cmd[%d] offset[0x%lx] error\n", mdev->device_fd, cmd, mdev->conf_map.conf_offset + PCI_COMMAND);
+                return -1;
+            }
+
+    if (vfio_read(mdev->device_fd, &cmd,
+            sizeof(cmd), mdev->conf_map.conf_offset + PCI_COMMAND)) {
+                printf("pread fd[%d] cmd[%d] offset[0x%lx] error\n", mdev->device_fd, cmd, mdev->conf_map.conf_offset + PCI_COMMAND);
+                return -1;                
+            }
+    printf("pread fd[%d] cmd[0x%x] offset[0x%lx] successfully\n", mdev->device_fd, cmd, mdev->conf_map.conf_offset + PCI_COMMAND);
+	return 0;
+}
+
 int mdev_mm_init(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         printf("invalid parameter of mdev\n");
@@ -1069,6 +1136,10 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         return -1;
     }
 
+    if (pci_vfio_enable_bus_memory(mdev)) {
+        printf("failed to enable bus memory\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -1310,6 +1381,7 @@ int veth_setup_raw_socket(const char* if_name) {
 #define HOST_STATUS_REG(mdev)      ((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_STATUS_REG_OFFSET)
 #define HOST_RESET_STATUS_REG(mdev) ((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_RESET_STATUS_REG_OFFSET)
 #define HOST_VERSION_REG(mdev)      ((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_VERSION_OFFSET)
+#define HOST_VERSION_OFFSET_VAL(mdev)      (mdev->bar_map[BAR4].offset + HOST_VERSION_OFFSET)
 #define HOST_MBOX_ACK_REG(mdev)    ((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_MBOX_ACK_OFFSET)
 #define HOST_MBOX_MSG_REG(mdev, i)    \
 	((uint8_t*)mdev->bar_map[BAR4].bar_addr + HOST_MBOX_OFFSET + (i * 8))
@@ -1327,17 +1399,7 @@ int veth_setup_raw_socket(const char* if_name) {
 #define OCTNET_RX_DESC_OFFSET 0x20000B8
 #define OCTNET_TX_DESC_OFFSET 0x20000c0
 
-/***********************************     pci_regs.h   ***************************************
-#define PCI_VENDOR_ID		0x00
-#define PCI_DEVICE_ID		0x02
-#define PCI_COMMAND		0x04
-#define  PCI_COMMAND_IO		0x1
-#define  PCI_COMMAND_MEMORY	0x2
-#define  PCI_COMMAND_MASTER	0x4
 
-#define PCI_CAPABILITY_LIST	0x34
-#define PCI_EXP_DEVCTL		0x08
-********************************************************************************************/
 #define OCTBOOT_NET_VERSION "1.0"
 #define OCTBOOT_NET_VERSION_MAJOR 1
 #define OCTBOOT_NET_VERSION_MINOR 0
@@ -1347,7 +1409,7 @@ int veth_setup_raw_socket(const char* if_name) {
 #define PCI_EXP_DEVCTL		                    0x08
 #define  PCI_EXP_DEVCTL_BCR_FLR                 0x8000
 #define PCI_CONF_REG(mdev)                      ((uint8_t*)mdev->conf_map.conf_addr)
-#define PCI_CONF_CMD_REG(mdev)                  ((uint8_t*)mdev->conf_map.conf_addr + 0x04)
+#define PCI_CONF_CMD_REG(mdev)                  ((uint8_t*)mdev->conf_map.conf_addr + PCI_COMMAND)
 
 
 #define CNXK_SDP_WIN_WR_MASK_REG                0x20030
@@ -1536,55 +1598,39 @@ static int handle_target_status(octboot_net_device_t* mdev)
 	return ret;
 }
 
-static int
-pci_vfio_enable_bus_memory(octboot_net_device_t* mdev)
-{
-	uint16_t cmd;
-
-
-	int ret = pread(mdev->container_fd, &cmd, sizeof(cmd), mdev->conf_map.conf_offset + RTE_PCI_COMMAND);
-	if (ret != sizeof(cmd)) {
-		printf("Cannot read command from PCI config space!\n");
-		return -1;
-	}
-
-	if (cmd & RTE_PCI_COMMAND_MEMORY) {
-        printf("Memory already enabled\n");
-        return 0;
-    }
-
-	cmd |= RTE_PCI_COMMAND_MEMORY;
-	ret = pwrite(mdev->container_fd, &cmd, sizeof(cmd), mdev->conf_map.conf_offset + RTE_PCI_COMMAND);
-	if (ret != sizeof(cmd)) {
-		printf("Cannot write command to PCI config space!\n");
-		return -1;
-	}
-
-	return 0;
-}
-
 static int octeon_target_setup(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         printf("invalid parameter of mdev\n");
         return -1;
     }
+
 #if 0
-    pci_reset_function(mdev);
-    pci_enable_device(mdev);
-#endif
-#if 0
-    if (pci_vfio_enable_bus_memory(mdev)) {
-        printf("failed to enable bus memory\n");
-        return -1;
-    }
-#endif
     if (ioctl(mdev->container_fd, VFIO_DEVICE_RESET)) {
         printf("Unable to reset device! Error: %d (%s)", errno, strerror(errno));
         return -1;
     }
-
+#endif
     uint64_t host_version = ((OCTBOOT_NET_VERSION_MAJOR << 8)|OCTBOOT_NET_VERSION_MINOR);
-	writeq(host_version, HOST_VERSION_REG(mdev));
+    uint64_t host_version0, host_version1;
+    if (vfio_read(mdev->device_fd, &host_version0,
+        sizeof(host_version0), HOST_VERSION_OFFSET_VAL(mdev))) {
+            printf("read fd[%d] host_version0[0x%lx] offset[0x%lx] error\n", mdev->device_fd, host_version0, HOST_VERSION_OFFSET_VAL(mdev));
+            return -1;
+        }
+    printf("read fd[%d] host_version0[0x%lx] offset[0x%lx]\n", mdev->device_fd, host_version0, HOST_VERSION_OFFSET_VAL(mdev));
+    if (vfio_write(mdev->device_fd, &host_version,
+            sizeof(host_version), HOST_VERSION_OFFSET_VAL(mdev))) {
+                printf("write fd[%d] host_version[0x%lx] offset[0x%lx] error\n", mdev->device_fd, host_version,HOST_VERSION_OFFSET_VAL(mdev));
+                return -1;
+            }
+    printf("write fd[%d] host_version[0x%lx] offset[0x%lx]\n", mdev->device_fd, host_version,HOST_VERSION_OFFSET_VAL(mdev));
+    if (vfio_read(mdev->device_fd, &host_version1,
+        sizeof(host_version1), HOST_VERSION_OFFSET_VAL(mdev))) {
+            printf("read fd[%d] host_version1[0x%lx] offset[0x%lx] error\n", mdev->device_fd, host_version1, HOST_VERSION_OFFSET_VAL(mdev));
+            return -1;
+        }
+    printf("read fd[%d] host_version1[0x%lx] offset[0x%lx]\n", mdev->device_fd, host_version1, HOST_VERSION_OFFSET_VAL(mdev));
+
 	uint64_t target_version = get_target_version(mdev);
     if ((host_version >> 8) != (target_version >> 8)) {
         printf("octboot_net driver imcompatible with uboot\n");

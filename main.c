@@ -1,3 +1,4 @@
+#define _LARGEFILE64_SOURCE
 #include <linux/vfio.h>
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
@@ -689,6 +690,42 @@ pci_vfio_get_msix_bar(octboot_net_device_t* mdev,
 	return 0;
 }
 
+static void* remote_map(const char *filename, int fd,
+			uint64_t physical_address,
+			uint64_t length)
+{
+	printf("0x%llx, 0x%zx", (unsigned long long)physical_address, length);
+	void *result;
+	uint64_t pagesize = sysconf(_SC_PAGESIZE);
+	int file_handle = filename ? open(filename, O_RDWR) : fd;
+	if (file_handle < 0)
+	{
+		printf("open failed\n");
+		return NULL;
+	}
+
+	/* Align the size and address to the page boundary. */
+	uint64_t offset = physical_address & (pagesize - 1);
+	uint64_t alength = (length + offset + pagesize - 1) & ~(pagesize - 1);
+
+	result = mmap64(NULL, alength, PROT_READ|PROT_WRITE, MAP_SHARED, file_handle,
+			physical_address - offset);
+	if (result == MAP_FAILED)
+	{
+        printf("mmap64 failed: %s\n", strerror(errno));
+		/* only close file IF we opened it */
+		if (filename)
+			close(file_handle);
+		return NULL;
+	}
+
+	/* only close file IF we opened it */
+	if (filename)
+		close(file_handle);
+	printf("remote_map:%p", result + offset);
+	return result + offset;
+}
+
 int mdev_bar_map(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         printf("invalid parameter of mdev\n");
@@ -728,16 +765,7 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
     }
 #endif
 
-    if (pci_vfio_get_msix_bar(mdev, &mdev->msix_table) < 0) {
-        printf("failed to get msix bar\n");
-        mdev_mm_uninit(mdev);
-        return -1;
-    }
-
     for (int i = 0; i < NUM_BARS; i++) {
-        if (i*2 == mdev->msix_table.bar_index) {
-            continue;
-        }
 
         struct vfio_region_info reg = {
             .argsz = sizeof(reg),
@@ -750,16 +778,28 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
         }
 
         bool iobar = pci_vfio_is_ioport_bar(mdev, i*2);
-        bool mappable = (reg.flags & VFIO_REGION_INFO_FLAG_MMAP) != 0;
-        struct vfio_info_cap_header* hdr = pci_vfio_info_cap(&reg, VFIO_REGION_INFO_CAP_SPARSE_MMAP);
-        bool sparse = hdr != NULL;
-        printf("bar%d region info, offset=0x%llx, size=%llu, iobar=%d, mappable=%d, sparse=%d\n", 
-            i*2, reg.offset, reg.size, iobar, mappable, sparse);
+        printf("bar%d region info, offset=0x%llx, size=%llu, iobar=%d, flags=0x%x\n", 
+            i*2, reg.offset, reg.size, iobar, reg.flags);
 
         mdev->bar_map[i].bar_size = reg.size;
         mdev->bar_map[i].offset = reg.offset;
         mdev->bar_map[i].iobar = iobar;
         mdev->bar_map[i].bar_flags = reg.flags;
+
+        bool mappable = (reg.flags & VFIO_REGION_INFO_FLAG_MMAP) != 0;
+        if (!mappable) {
+            printf("bar%d is not mappable\n", i*2);
+            continue;
+        }
+
+        mdev->bar_map[i].bar_addr = remote_map(NULL, mdev->device_fd, reg.offset, reg.size);
+        if (mdev->bar_map[i].bar_addr == NULL) {
+            printf("failed to map bar %d\n", i*2);
+            mdev_mm_uninit(mdev);
+            return -1;
+        }
+        printf("bar%d bar_addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
+
 #if 0
         if (i==BAR4) {
             uint64_t buffer;
@@ -1116,6 +1156,13 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         return -1;
     }
 
+    struct vfio_iommu_type1_info iommu_info;
+    if (ioctl(mdev->container_fd, VFIO_IOMMU_GET_INFO, &iommu_info)) {
+        printf("failed to get iommu info\n");
+        mdev_mm_uninit(mdev);
+        return -1;
+    }
+
     mdev->device_fd = ioctl(mdev->group_fd, VFIO_GROUP_GET_DEVICE_FD, mdev->pci_addr);
     if (mdev->device_fd < 0) {
         printf("failed to get device fd\n");
@@ -1123,6 +1170,12 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         return -1;
     }
     printf("device_fd=0x%x\n", mdev->device_fd);
+    struct vfio_device_info device_info;
+    if (ioctl(mdev->device_fd, VFIO_DEVICE_GET_INFO, &device_info)) {
+        printf("failed to get device info\n");
+        mdev_mm_uninit(mdev);
+        return -1;
+    }    
 
     if (mdev_conf_map(mdev) < 0) {
         printf("failed to map conf\n");
@@ -1612,6 +1665,16 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
 #endif
     uint64_t host_version = ((OCTBOOT_NET_VERSION_MAJOR << 8)|OCTBOOT_NET_VERSION_MINOR);
     uint64_t host_version0, host_version1;
+    host_version0 = readq(HOST_VERSION_REG(mdev));
+    printf("host_version0[0x%lx]\n", host_version0);
+    writeq(host_version, HOST_VERSION_REG(mdev));
+    host_version1 = readq(HOST_VERSION_REG(mdev));
+    printf("host_version1[0x%lx]\n", host_version1);
+    if (host_version1 != host_version) {
+        printf("Failed to set host version\n");
+        return -1;
+    }
+#if 0
     if (vfio_read(mdev->device_fd, &host_version0,
         sizeof(host_version0), HOST_VERSION_OFFSET_VAL(mdev))) {
             printf("read fd[%d] host_version0[0x%lx] offset[0x%lx] error\n", mdev->device_fd, host_version0, HOST_VERSION_OFFSET_VAL(mdev));
@@ -1630,7 +1693,7 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
             return -1;
         }
     printf("read fd[%d] host_version1[0x%lx] offset[0x%lx]\n", mdev->device_fd, host_version1, HOST_VERSION_OFFSET_VAL(mdev));
-
+#endif
 	uint64_t target_version = get_target_version(mdev);
     if ((host_version >> 8) != (target_version >> 8)) {
         printf("octboot_net driver imcompatible with uboot\n");

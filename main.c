@@ -21,6 +21,8 @@
 #include "desc_queue.h"
 #include "mmio_api.h"
 
+//#define VFIO_ENABLED 1
+
 #define NUM_DEVICES                 3
 #define NUM_BARS                    3  // BAR0, BAR2, BAR4
 #define BAR0                        0
@@ -92,13 +94,21 @@
 #define PCI_CAPABILITY_LIST	0x34
 #define PCI_EXP_DEVCTL		0x08
 ********************************************************************************************/
-#define VFIO_PCI_CONFIG_REGION_SIZE 256
 #define PCI_VENDOR_ID		0x00
 #define PCI_DEVICE_ID   0x02	/* 16 bits */
 #define PCI_COMMAND     0x04	/* 16 bits */
 #define PCI_COMMAND_MEMORY 0x2	/* Enable response in Memory space */
 #define PCI_COMMAND_MASTER 0x4	/* Enable bus mastering */
 #define PCI_REVISION_ID		0x08
+
+#define PCI_CAPABILITY_LIST	                    0x34
+#define  PCI_CAP_ID_EXP		                    0x10
+#define PCI_EXP_DEVCTL		                    0x08
+#define  PCI_EXP_DEVCTL_BCR_FLR                 0x8000
+#define PCI_CONF_REG(mdev)                      ((uint8_t*)mdev->conf_map.conf_addr)
+#define PCI_CONF_CMD_REG(mdev)                  ((uint8_t*)mdev->conf_map.conf_addr + PCI_COMMAND)
+
+#define VFIO_PCI_CONFIG_REGION_SIZE 256
 
 // dpdk logic
 #define RTE_PCI_BASE_ADDRESS_0	0x10
@@ -228,6 +238,8 @@ typedef struct {
     int device_fd;
     struct uboot_pcinet_barmap npu_memmap_info;
     bool signature_found;
+    int hugepage_fd;
+    void* hugepage_addr;
     uint32_t send_mbox_id;
 	uint32_t recv_mbox_id;
     conf_map_t conf_map;
@@ -514,24 +526,7 @@ int mdev_get_phy_addr(octboot_net_device_t* mdev) {
 }
 
 int mdev_conf_map(octboot_net_device_t* mdev) {
-#if 0
-    char path[256];
-    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/config", mdev->pci_addr);
-    mdev->conf_map.fd = open(path, O_RDWR | O_SYNC);
-    if (mdev->conf_map.fd < 0) {
-        printf("failed to open device config file:%s\n", path);
-        return -1;
-    }
-
-    mdev->conf_map.conf_size = 0x1000;    // 4KB for config space
-    off_t target = 0;
-    off_t target_base = target & ~(sysconf(_SC_PAGE_SIZE)-1);
-    mdev->conf_map.conf_size = target + mdev->conf_map.conf_size - target_base;
-    printf("mmap(%d, %d, 0x%x, 0x%x, %d, 0x%x)\n", 0, mdev->conf_map.conf_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->conf_map.fd, (int) target);
-    mdev->conf_map.conf_addr = mmap(0, mdev->conf_map.conf_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->conf_map.fd, target);
-    printf("conf addr=%p\n", mdev->conf_map.conf_addr);
-#endif
-
+#ifdef VFIO_ENABLED
     struct vfio_region_info reg = {
         .argsz = sizeof(reg),
         .index = VFIO_PCI_CONFIG_REGION_INDEX
@@ -545,19 +540,9 @@ int mdev_conf_map(octboot_net_device_t* mdev) {
 
     mdev->conf_map.conf_size = reg.size;
     mdev->conf_map.conf_offset = reg.offset;
-
-#if 0
-    mdev->conf_map.conf_addr = mmap(NULL, reg.size, 
-        PROT_READ | PROT_WRITE,
-        //PROT_READ,
-        MAP_SHARED,  // Note: should be MAP_SHARED not MAP_PRIVATE
-        mdev->device_fd,
-        reg.offset);  // Use reg.offset for conf mapping
-    if (mdev->conf_map.conf_addr == MAP_FAILED) {
-        printf("mmap failed: %s\n", strerror(errno));
-        mdev_mm_uninit(mdev);
-        return -1;
-    }
+#else
+    // pread/pwrite conf region directly, no need to mmap it
+    printf("nothing to do for physical conf region map mdev=%p", (void*)mdev);
 #endif
     return 0;
 }
@@ -731,40 +716,7 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
         printf("invalid parameter of mdev\n");
         return -1;
     }
-#if 0
-    char path[256];
-    for (int i=0; i<NUM_BARS; i++) {
-        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource%d", mdev->pci_addr, i*2);
-        mdev->bar_map[i].fd = open(path, O_RDWR | O_SYNC);
-        if (mdev->bar_map[i].fd < 0) {
-            printf("failed to open device config file:%s\n", path);
-            return -1;
-        }
-
-        switch (i) {
-        case BAR0:
-            mdev->bar_map[i].bar_size = 0x800000;    // 8MB for BAR0
-            break;
-        case BAR2:
-            mdev->bar_map[i].bar_size = 0x10000000;  // 256MB for BAR2
-            break;
-        case BAR4:
-            mdev->bar_map[i].bar_size = 0x4000000;   // 64MB for BAR4
-            break;
-        default:
-            printf("invalid bar index, should never be here\n");
-            return -1;
-        }
-
-        off_t target = 0;
-        off_t target_base = target & ~(sysconf(_SC_PAGE_SIZE)-1);
-        mdev->bar_map[i].bar_size = target + mdev->bar_map[i].bar_size - target_base;
-        printf("mmap(%d, %d, 0x%x, 0x%x, %d, 0x%x)\n", 0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->bar_map[i].fd, (int) target);
-        mdev->bar_map[i].bar_addr = mmap(0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->bar_map[i].fd, target);
-        printf("bar%d addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
-    }
-#endif
-
+#ifdef VFIO_ENABLED
     for (int i = 0; i < NUM_BARS; i++) {
 
         struct vfio_region_info reg = {
@@ -792,62 +744,83 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
             continue;
         }
 
-        mdev->bar_map[i].bar_addr = remote_map(NULL, mdev->device_fd, reg.offset, reg.size);
+        void* mapped_addr = remote_map(NULL, mdev->device_fd, reg.offset, reg.size);
+        mdev->bar_map[i].bar_addr = (void*)((uint64_t)mapped_addr & 0xfffffffffffffff0ull);
         if (mdev->bar_map[i].bar_addr == NULL) {
             printf("failed to map bar %d\n", i*2);
             mdev_mm_uninit(mdev);
             return -1;
         }
         printf("bar%d bar_addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
-
-#if 0
-        if (i==BAR4) {
-            uint64_t buffer;
-            off_t asb_offset = reg.offset + 0x2000060;
-            ssize_t bytes = pread(mdev->device_fd, &buffer, sizeof(uint64_t), asb_offset);
-            printf("bytes=%ld, buffer=0x%lx\n", bytes, buffer);
-        }
-#endif
-
-#if 0
-        mdev->bar_map[i].bar_addr = mmap(NULL, reg.size, 
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED,  // Note: should be MAP_SHARED not MAP_PRIVATE
-            mdev->device_fd,
-            reg.offset);  // Use reg.offset for BAR mapping
-        if (mdev->bar_map[i].bar_addr == MAP_FAILED) {
-            printf("failed to map bar %d\n", i);
-            mdev_mm_uninit(mdev);
-            return -1;
-        }
-#endif
-
-#if 0
-        void* bar_addr = mmap(0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_PRIVATE |
-        MAP_ANONYMOUS, -1, 0);
-        if (bar_addr == MAP_FAILED) {
-            printf("failed to map vaddr of bar %d\n", i*2);
-            return -1;
-        }
-        printf("bar%d bar_addr=%p\n", i*2, bar_addr);
-
-        void* map_addr = mmap(bar_addr, mdev->bar_map[i].bar_size,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED | MAP_FIXED, mdev->device_fd, mdev->bar_map[i].offset);
-        if (map_addr == MAP_FAILED) {
-            printf("failed to map paddr of bar %d\n", i*2);
-            munmap(bar_addr, mdev->bar_map[i].bar_size); 
-            return -1;
-        }
-        printf("bar%d map_addr=%p\n", i*2, map_addr);
-        mdev->bar_map[i].bar_addr = map_addr;
-#endif
     }
+#else
+    char path[256];
+    for (int i=0; i<NUM_BARS; i++) {
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource%d", mdev->pci_addr, i*2);
+        mdev->bar_map[i].fd = open(path, O_RDWR | O_SYNC);
+        if (mdev->bar_map[i].fd < 0) {
+            printf("failed to open device config file:%s\n", path);
+            return -1;
+        }
 
+        switch (i) {
+        case BAR0:
+            mdev->bar_map[i].bar_size = 0x800000;    // 8MB for BAR0
+            break;
+        case BAR2:
+            mdev->bar_map[i].bar_size = 0x10000000;  // 256MB for BAR2
+            break;
+        case BAR4:
+            mdev->bar_map[i].bar_size = 0x4000000;   // 64MB for BAR4
+            break;
+        default:
+            printf("invalid bar index, should never be here\n");
+            return -1;
+        }
+
+        off_t target = 0;
+        off_t target_base = target & ~(sysconf(_SC_PAGE_SIZE)-1);
+        mdev->bar_map[i].bar_size = target + mdev->bar_map[i].bar_size - target_base;
+        printf("mmap(%d, %ld, 0x%x, 0x%x, %d, 0x%x)\n", 0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->bar_map[i].fd, (int) target);
+        mdev->bar_map[i].bar_addr = mmap(0, mdev->bar_map[i].bar_size, PROT_READ | PROT_WRITE, MAP_SHARED, mdev->bar_map[i].fd, target);
+        printf("bar%d addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
+    }
+#endif
     return 0;
 }
 
-int vfio_dma_map_circq(octboot_net_device_t* mdev) {
+uint64_t get_physical_address(void* virtual_address) {
+    uint64_t virtual_page_number = (uint64_t)virtual_address / sysconf(_SC_PAGE_SIZE);
+    uint64_t offset = virtual_page_number * sizeof(uint64_t);
+    uint64_t physical_page_number;
+    int pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
+    if (pagemap_fd < 0) {
+        printf("open");
+        return -1;
+    }
+    if (lseek(pagemap_fd, offset, SEEK_SET) == (off_t)-1) {
+        printf("lseek");
+        close(pagemap_fd);
+        return -1;
+    }
+    if (read(pagemap_fd, &physical_page_number, sizeof(uint64_t)) != sizeof(uint64_t)) {
+        printf("read");
+        close(pagemap_fd);
+        return -1;
+    }
+    close(pagemap_fd);
+    if (!(physical_page_number & (1ULL << 63))) {
+        printf("Page not present\n");
+        return -1;
+    }
+    physical_page_number &= ((1ULL << 54) - 1);
+    uint64_t physical_address = (physical_page_number * sysconf(_SC_PAGE_SIZE)) + ((uint64_t)virtual_address % sysconf(_SC_PAGE_SIZE));
+    return physical_address;
+}
+
+int mdev_dma_map_circq(octboot_net_device_t* mdev) {
+
+#ifdef VFIO_ENABLED
     mdev->rxq[0].vaddr_prod_idx = mmap(NULL, sizeof(uint32_t) * OCTBOOT_NET_MAXQ, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct vfio_iommu_type1_dma_map dma_map1 = {
@@ -907,10 +880,16 @@ int vfio_dma_map_circq(octboot_net_device_t* mdev) {
         return -1;
     }
     mdev->txq[0].iova_cons_idx = (void*)dma_map4.iova;
+#else
+    mdev->rxq[0].vaddr_cons_idx = mdev->hugepage_addr;
+    mdev->rxq[0].iova_cons_idx = (void*)get_physical_address(mdev->hugepage_addr);
+
+#endif
+
     return 0;
 }
 
-int vfio_dma_map_pktbuf(octboot_net_device_t* mdev) {
+int mdev_dma_map_pktbuf(octboot_net_device_t* mdev) {
 
     mdev->rxq[0].vaddr_pktbuf = mmap(NULL, OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1032,19 +1011,44 @@ int mdev_setup_tx_ring(octboot_net_device_t* mdev) {
     return 0;
 }
 
+#define HUGEPAGE_SIZE (1 * 1024 * 1024 * 1024) // 1 GiB
+int mdev_hugepage_alloc(octboot_net_device_t* mdev) {
+    if (mdev == NULL) {
+        printf("invalid parameter of mdev\n");
+        return -1;
+    }
+
+    mdev->hugepage_fd = open("/dev/hugepages/hugepagefile", O_CREAT | O_RDWR, 0755);
+    if (mdev->hugepage_fd < 0) {
+        printf("failed to open hugepagefile\n");
+        return -1;
+    }
+    printf("hugepage_fd = %d\n", mdev->hugepage_fd);
+
+    mdev->hugepage_addr = mmap(NULL, HUGEPAGE_SIZE,
+        PROT_READ | PROT_WRITE, MAP_SHARED, mdev->hugepage_fd, 0);
+    if (mdev->hugepage_addr == MAP_FAILED) {
+        printf("failed to mmap hugepage\n");
+        return -1;
+    }
+    printf("hugepage_addr = %p\n", mdev->hugepage_addr);
+
+    return 0;
+}
+
 int mdev_dma_init(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         printf("invalid parameter of mdev\n");
         return -1;
     }
 
-    if (vfio_dma_map_circq(mdev) < 0) {
+    if (mdev_dma_map_circq(mdev) < 0) {
         printf("failed to map dma\n");
         mdev_dma_uninit(mdev);
         return -1;
     }
 
-    if (vfio_dma_map_pktbuf(mdev) < 0) {
+    if (mdev_dma_map_pktbuf(mdev) < 0) {
         printf("failed to map dma pktbuf\n");
         mdev_dma_uninit(mdev);
         return -1;
@@ -1074,28 +1078,41 @@ static int vfio_write(int fd, void *buf, ssize_t len, off_t off)
 }
 
 static int
-pci_vfio_enable_bus_memory(octboot_net_device_t* mdev)
+pci_enable_bus_memory(octboot_net_device_t* mdev)
 {
+    int fd = -1;
+    off_t offset = 0;
+#ifdef VFIO_ENABLED
+    fd = mdev->device_fd;
+    offset = mdev->conf_map.conf_offset + PCI_COMMAND;
+#else
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/config", mdev->pci_addr);
+    fd = open(path, O_RDWR | O_SYNC);
+    if (fd < 0) {
+        printf("failed to open device config file:%s\n", path);
+        return -1;
+    }
+    offset = PCI_COMMAND;
+#endif
 	uint16_t cmd;
-    if (vfio_read(mdev->device_fd, &cmd,
-            sizeof(cmd), mdev->conf_map.conf_offset + PCI_COMMAND)) {
-                printf("pread fd[%d] cmd[%d] offset[0x%lx] error\n", mdev->device_fd, cmd, mdev->conf_map.conf_offset + PCI_COMMAND);
-                return -1;
-            }
+    int len;
+    len = pread(fd, &cmd, sizeof(cmd), offset);
+    printf("pread fd[%d] cmd[0x%x] offset[0x%lx] len[%d]\n", fd, cmd, offset, len);
 
     cmd |= PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY;
-    if (vfio_write(mdev->device_fd, &cmd,
-            sizeof(cmd), mdev->conf_map.conf_offset + PCI_COMMAND)) {
-                printf("pread fd[%d] cmd[%d] offset[0x%lx] error\n", mdev->device_fd, cmd, mdev->conf_map.conf_offset + PCI_COMMAND);
-                return -1;
-            }
+    len = pwrite(fd, &cmd, sizeof(cmd), offset);
+    printf("pread fd[%d] cmd[0x%x] offset[0x%lx] len[%d]\n", fd, cmd, offset, len);
 
-    if (vfio_read(mdev->device_fd, &cmd,
-            sizeof(cmd), mdev->conf_map.conf_offset + PCI_COMMAND)) {
-                printf("pread fd[%d] cmd[%d] offset[0x%lx] error\n", mdev->device_fd, cmd, mdev->conf_map.conf_offset + PCI_COMMAND);
-                return -1;                
-            }
-    printf("pread fd[%d] cmd[0x%x] offset[0x%lx] successfully\n", mdev->device_fd, cmd, mdev->conf_map.conf_offset + PCI_COMMAND);
+    len = pread(fd, &cmd, sizeof(cmd), offset);
+    printf("pread fd[%d] cmd[0x%x] offset[0x%lx] len[%d]\n", fd, cmd, offset, len);
+
+#ifdef VFIO_ENABLED
+    // nothing to do
+#else
+    if (fd)
+        close(fd);
+#endif
 	return 0;
 }
 
@@ -1104,7 +1121,7 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         printf("invalid parameter of mdev\n");
         return -1;
     }
-
+#ifdef VFIO_ENABLED
     mdev->container_fd = open("/dev/vfio/vfio", O_RDWR);
     if (mdev->container_fd < 0) {
         printf("failed to open vfio container\n");
@@ -1155,14 +1172,14 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         mdev_mm_uninit(mdev);
         return -1;
     }
-
+#if 0
     struct vfio_iommu_type1_info iommu_info;
     if (ioctl(mdev->container_fd, VFIO_IOMMU_GET_INFO, &iommu_info)) {
         printf("failed to get iommu info\n");
         mdev_mm_uninit(mdev);
         return -1;
     }
-
+#endif
     mdev->device_fd = ioctl(mdev->group_fd, VFIO_GROUP_GET_DEVICE_FD, mdev->pci_addr);
     if (mdev->device_fd < 0) {
         printf("failed to get device fd\n");
@@ -1170,13 +1187,15 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         return -1;
     }
     printf("device_fd=0x%x\n", mdev->device_fd);
+#if 0
     struct vfio_device_info device_info;
     if (ioctl(mdev->device_fd, VFIO_DEVICE_GET_INFO, &device_info)) {
         printf("failed to get device info\n");
         mdev_mm_uninit(mdev);
         return -1;
-    }    
-
+    }
+#endif
+#endif
     if (mdev_conf_map(mdev) < 0) {
         printf("failed to map conf\n");
         mdev_mm_uninit(mdev);
@@ -1189,7 +1208,7 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
         return -1;
     }
 
-    if (pci_vfio_enable_bus_memory(mdev)) {
+    if (pci_enable_bus_memory(mdev)) {
         printf("failed to enable bus memory\n");
         return -1;
     }
@@ -1457,13 +1476,6 @@ int veth_setup_raw_socket(const char* if_name) {
 #define OCTBOOT_NET_VERSION_MAJOR 1
 #define OCTBOOT_NET_VERSION_MINOR 0
 
-#define PCI_CAPABILITY_LIST	                    0x34
-#define  PCI_CAP_ID_EXP		                    0x10
-#define PCI_EXP_DEVCTL		                    0x08
-#define  PCI_EXP_DEVCTL_BCR_FLR                 0x8000
-#define PCI_CONF_REG(mdev)                      ((uint8_t*)mdev->conf_map.conf_addr)
-#define PCI_CONF_CMD_REG(mdev)                  ((uint8_t*)mdev->conf_map.conf_addr + PCI_COMMAND)
-
 
 #define CNXK_SDP_WIN_WR_MASK_REG                0x20030
 #define CNXK_RST_CHIP_DOMAIN_W1S                0x000087E006001810ULL
@@ -1614,8 +1626,7 @@ static int handle_target_status(octboot_net_device_t* mdev)
 	int ret = 0;
 	uint64_t host_status = get_host_status(mdev);
 	uint64_t target_status = get_target_status(mdev);
-	printf("host status %lu\n", host_status);
-	printf("target status %lu\n", target_status);
+	printf("host status %lu, target status %lu\n", host_status, target_status);
 
 	switch (host_status) {
 	case OCTNET_HOST_READY:
@@ -1644,7 +1655,7 @@ static int handle_target_status(octboot_net_device_t* mdev)
 		}
 		break;
 	default:
-		printf("octboot_net: unhandled state transition host_status:%lu target_status %lu\n",
+		printf("unhandled state transition host_status:%lu target_status %lu\n",
 		       host_status, target_status);
 		break;
 	}
@@ -1663,18 +1674,9 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
         return -1;
     }
 #endif
-    uint64_t host_version = ((OCTBOOT_NET_VERSION_MAJOR << 8)|OCTBOOT_NET_VERSION_MINOR);
-    uint64_t host_version0, host_version1;
-    host_version0 = readq(HOST_VERSION_REG(mdev));
-    printf("host_version0[0x%lx]\n", host_version0);
-    writeq(host_version, HOST_VERSION_REG(mdev));
-    host_version1 = readq(HOST_VERSION_REG(mdev));
-    printf("host_version1[0x%lx]\n", host_version1);
-    if (host_version1 != host_version) {
-        printf("Failed to set host version\n");
-        return -1;
-    }
-#if 0
+
+
+#ifdef VFIO_ENABLED
     if (vfio_read(mdev->device_fd, &host_version0,
         sizeof(host_version0), HOST_VERSION_OFFSET_VAL(mdev))) {
             printf("read fd[%d] host_version0[0x%lx] offset[0x%lx] error\n", mdev->device_fd, host_version0, HOST_VERSION_OFFSET_VAL(mdev));
@@ -1693,17 +1695,29 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
             return -1;
         }
     printf("read fd[%d] host_version1[0x%lx] offset[0x%lx]\n", mdev->device_fd, host_version1, HOST_VERSION_OFFSET_VAL(mdev));
-#endif
+#else
+    uint64_t host_version = ((OCTBOOT_NET_VERSION_MAJOR << 8)|OCTBOOT_NET_VERSION_MINOR);
+    uint64_t host_version0, host_version1;
+    host_version0 = readq(HOST_VERSION_REG(mdev));
+    if (host_version0 != host_version) {
+        writeq(host_version, HOST_VERSION_REG(mdev));
+        host_version1 = readq(HOST_VERSION_REG(mdev));
+        if (host_version1 != host_version) {
+            printf("Failed to set host version\n");
+            return -1;
+        }
+    }
+
 	uint64_t target_version = get_target_version(mdev);
     if ((host_version >> 8) != (target_version >> 8)) {
-        printf("octboot_net driver imcompatible with uboot\n");
-        printf("host_version:0x%lx\n", host_version);
-        printf("target_version:0x%lx\n", target_version);
+        printf("octboot_net driver imcompatible with uboot, host_version:0x%lx, target_version:0x%lx\n",
+            host_version, target_version);
         return -1;
     }
 
+    // signature found
     memcpy(&mdev->npu_memmap_info, SIGNATURE_REG(mdev),
-			sizeof(struct uboot_pcinet_barmap));
+		sizeof(struct uboot_pcinet_barmap));
     uint64_t signature = mdev->npu_memmap_info.signature;
     if (signature == NPU_HANDSHAKE_SIGNATURE) {
         if (!mdev->signature_found) {
@@ -1717,6 +1731,14 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
         return -1;
     }
 
+    change_host_status(mdev, OCTNET_HOST_READY, false);
+    usleep(1000);
+#endif
+
+    return 0;
+}
+
+static int octeon_target_setup_2(octboot_net_device_t* mdev) {
     union octboot_net_mbox_msg msg;
     int word_num = mbox_check_msg_rcvd(mdev, &msg);
     if (word_num == 0) {
@@ -1734,10 +1756,17 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
     default:
         break;
     }
-
+#if 0
     if ((OCTNET_TARGET_RUNNING != get_target_status(mdev)) 
     || OCTNET_HOST_RUNNING != get_host_status(mdev))
         return -1;
+#endif
+
+    if ((OCTNET_TARGET_READY != get_target_status(mdev)) 
+        || OCTNET_TARGET_READY != get_host_status(mdev)) {
+        printf("target status is not ready\n");
+        return -1;
+    }
 
     return 0;
 }
@@ -1781,22 +1810,32 @@ int main(int argc, char *argv[]) {
     snprintf(octbootdev[0].pci_addr, sizeof(octbootdev[0].pci_addr), "%s", argv[2]);
 
     while (mdev_mm_init(&octbootdev[0]) < 0) {
-        printf("failed to init vfio\n");
+        printf("failed to init memory\n");
         usleep(INIT_SLEEP_US);
     }
-    printf("vfio is initiated successfully\n");
+    printf("memory is initiated successfully\n");
 
     while (octeon_target_setup(&octbootdev[0]) < 0) {
         printf("failed to setup target\n");
         usleep(INIT_SLEEP_US);
     }
     printf("octeon target comes up\n");
-#if 0
+
+    while (octeon_target_setup_2(&octbootdev[0]) < 0) {
+        usleep(INIT_SLEEP_US);
+    }
+
+    if (mdev_hugepage_alloc(&octbootdev[0]) < 0) {
+        printf("failed to allocate hugepage\n");
+        return -1;
+    }
+
+
     if (mdev_dma_init(&octbootdev[0]) < 0) {
         printf("failed to init dma\n");
         return -1;
     }
-
+#if 0
     if (mdev_setup_rx_ring(&octbootdev[0]) < 0) {
         printf("failed to setup rx ring\n");
         mdev_clean_rx_ring(&octbootdev[0]);

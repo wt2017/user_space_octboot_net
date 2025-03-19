@@ -110,6 +110,10 @@
 
 #define VFIO_PCI_CONFIG_REGION_SIZE 256
 
+// hugepage
+#define HUGEPAGE_SIZE (1 * 1024 * 1024 * 1024) // 1 GiB
+#define HUGEPAGE_PKTBUF_OFFSET (512 * 1024 * 1024) // 100 MiB
+
 // dpdk logic
 #define RTE_PCI_BASE_ADDRESS_0	0x10
 #define RTE_PCI_BASE_ADDRESS_SPACE_IO	0x01
@@ -188,9 +192,9 @@ struct octboot_net_sw_descq {
     void* vaddr_cons_idx;
     void* iova_cons_idx;
 
-    uint8_t* hw_descq;
-    uint32_t* hw_prod_idx;
-    uint32_t* hw_cons_idx;
+    uint8_t* addr_hw_descq;
+    uint32_t* addr_hw_prod_idx;
+    uint32_t* addr_hw_cons_idx;
 };
 
 typedef struct {
@@ -262,10 +266,12 @@ typedef enum {
 struct {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    pthread_status_t status;
+    pthread_status_t octeon_status;
+    pthread_status_t veth_status;
 } controller = {
     PTHREAD_MUTEX_INITIALIZER,
     PTHREAD_COND_INITIALIZER,
+    STATUS_RUNNING,
     STATUS_SUSPENDED
 };
 
@@ -300,11 +306,11 @@ int mdev_clean_tx_ring(octboot_net_device_t* mdev) {
     int descq_tot_size = sizeof(struct octboot_net_hw_descq) +
         (OCTBOOT_NET_NUM_ELEMENTS * sizeof(struct octboot_net_hw_desc_ptr));
     wmb();
-    mmio_memset(tq->hw_descq, 0, descq_tot_size);
+    mmio_memset(tq->addr_hw_descq, 0, descq_tot_size);
 
-    tq->hw_descq = NULL;
-    tq->hw_prod_idx = NULL;
-    tq->hw_cons_idx = NULL;
+    tq->addr_hw_descq = NULL;
+    tq->addr_hw_prod_idx = NULL;
+    tq->addr_hw_cons_idx = NULL;
     tq->status = OCTBOOT_NET_DESCQ_CLEAN;
     return 0;
 }
@@ -321,21 +327,22 @@ int mdev_clean_rx_ring(octboot_net_device_t* mdev) {
     int descq_tot_size = sizeof(struct octboot_net_hw_descq) +
 		(OCTBOOT_NET_NUM_ELEMENTS * sizeof(struct octboot_net_hw_desc_ptr));
 	wmb();
-	mmio_memset(rq->hw_descq, 0, descq_tot_size);
+	mmio_memset(rq->addr_hw_descq, 0, descq_tot_size);
 
-    rq->hw_descq = NULL;
-    rq->hw_prod_idx = NULL;
-    rq->hw_cons_idx = NULL;
+    rq->addr_hw_descq = NULL;
+    rq->addr_hw_prod_idx = NULL;
+    rq->addr_hw_cons_idx = NULL;
     rq->status = OCTBOOT_NET_DESCQ_CLEAN;
     return 0;
 }
 
-int vfio_dma_unmap_pktbuf(octboot_net_device_t* mdev) {
+int mdev_dma_unmap_pktbuf(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         printf("invalid parameter of mdev\n");
         return -1;
     }
 
+#ifdef VFIO_ENABLED
     struct vfio_iommu_type1_dma_unmap dma_unmap1 = {
         .argsz = sizeof(dma_unmap1),
         .size = OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
@@ -355,54 +362,71 @@ int vfio_dma_unmap_pktbuf(octboot_net_device_t* mdev) {
     munmap(mdev->txq[0].vaddr_pktbuf, OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS);
     mdev->txq[0].vaddr_pktbuf = NULL;
     mdev->txq[0].iova_pktbuf = NULL;
+#else
+    mdev->rxq[0].vaddr_pktbuf = NULL;
+    mdev->rxq[0].iova_pktbuf = NULL;
+    mdev->txq[0].vaddr_pktbuf = NULL;
+    mdev->txq[0].iova_pktbuf = NULL;
+#endif
     return 0;
 }
 
-int vfio_dma_unmap_circq(octboot_net_device_t* mdev) {
+int mdev_dma_unmap_circq(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         printf("invalid parameter of mdev\n");
         return -1;
     }
 
+#ifdef VFIO_ENABLED
     struct vfio_iommu_type1_dma_unmap dma_unmap1 = {
         .argsz = sizeof(dma_unmap1),
-        .size = OCTBOOT_NET_MAXQ,
+        .size = sizeof(uint32_t) * OCTBOOT_NET_MAXQ,
         .iova = (uint64_t)mdev->rxq[0].iova_prod_idx
     };
     ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap1);
-    munmap(mdev->rxq[0].vaddr_prod_idx, OCTBOOT_NET_MAXQ);
+    munmap(mdev->rxq[0].vaddr_prod_idx, sizeof(uint32_t) * OCTBOOT_NET_MAXQ);
     mdev->rxq[0].vaddr_prod_idx = NULL;
     mdev->rxq[0].iova_prod_idx = NULL;
 
     struct vfio_iommu_type1_dma_unmap dma_unmap2 = {
         .argsz = sizeof(dma_unmap2),
-        .size = OCTBOOT_NET_MAXQ,
+        .size = sizeof(uint32_t) * OCTBOOT_NET_MAXQ,
         .iova = (uint64_t)mdev->rxq[0].iova_cons_idx
     };
     ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap2);
-    munmap(mdev->rxq[0].vaddr_cons_idx, OCTBOOT_NET_MAXQ);
+    munmap(mdev->rxq[0].vaddr_cons_idx, sizeof(uint32_t) * OCTBOOT_NET_MAXQ);
     mdev->rxq[0].vaddr_cons_idx = NULL;
     mdev->rxq[0].iova_cons_idx = NULL;
 
     struct vfio_iommu_type1_dma_unmap dma_unmap3 = {
         .argsz = sizeof(dma_unmap3),
-        .size = OCTBOOT_NET_MAXQ,
+        .size = sizeof(uint32_t) * OCTBOOT_NET_MAXQ,
         .iova = (uint64_t)mdev->txq[0].iova_prod_idx
     };
     ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap3);
-    munmap(mdev->txq[0].vaddr_prod_idx, OCTBOOT_NET_MAXQ);
+    munmap(mdev->txq[0].vaddr_prod_idx, sizeof(uint32_t) * OCTBOOT_NET_MAXQ);
     mdev->txq[0].vaddr_prod_idx = NULL;
     mdev->txq[0].iova_prod_idx = NULL;
 
     struct vfio_iommu_type1_dma_unmap dma_unmap4 = {
         .argsz = sizeof(dma_unmap4),
-        .size = OCTBOOT_NET_MAXQ,
+        .size = sizeof(uint32_t) * OCTBOOT_NET_MAXQ,
         .iova = (uint64_t)mdev->txq[0].iova_cons_idx
     };
     ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap4);
-    munmap(mdev->txq[0].vaddr_cons_idx, OCTBOOT_NET_MAXQ);
+    munmap(mdev->txq[0].vaddr_cons_idx, sizeof(uint32_t) * OCTBOOT_NET_MAXQ);
     mdev->txq[0].vaddr_cons_idx = NULL;
     mdev->txq[0].iova_cons_idx = NULL;
+#else
+    mdev->rxq[0].vaddr_prod_idx = NULL;
+    mdev->rxq[0].iova_prod_idx = NULL;
+    mdev->rxq[0].vaddr_cons_idx = NULL;
+    mdev->rxq[0].iova_cons_idx = NULL;
+    mdev->txq[0].vaddr_prod_idx = NULL;
+    mdev->txq[0].iova_prod_idx = NULL;
+    mdev->txq[0].vaddr_cons_idx = NULL;
+    mdev->txq[0].iova_cons_idx = NULL;
+#endif
     return 0;
 }
 
@@ -454,8 +478,8 @@ int mdev_dma_uninit(octboot_net_device_t* mdev) {
         return -1;
     }
 
-    vfio_dma_unmap_pktbuf(mdev);
-    vfio_dma_unmap_circq(mdev);
+    mdev_dma_unmap_pktbuf(mdev);
+    mdev_dma_unmap_circq(mdev);
     return 0;
 }
 
@@ -542,7 +566,7 @@ int mdev_conf_map(octboot_net_device_t* mdev) {
     mdev->conf_map.conf_offset = reg.offset;
 #else
     // pread/pwrite conf region directly, no need to mmap it
-    printf("nothing to do for physical conf region map mdev=%p", (void*)mdev);
+    printf("nothing to do for physical conf region map mdev=%p\n", (void*)mdev);
 #endif
     return 0;
 }
@@ -789,33 +813,21 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
     return 0;
 }
 
-uint64_t get_physical_address(void* virtual_address) {
-    uint64_t virtual_page_number = (uint64_t)virtual_address / sysconf(_SC_PAGE_SIZE);
-    uint64_t offset = virtual_page_number * sizeof(uint64_t);
-    uint64_t physical_page_number;
-    int pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
-    if (pagemap_fd < 0) {
-        printf("open");
-        return -1;
+uint64_t virt_to_phys(uint64_t vaddr) {
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    uint64_t paddr = 0;
+    uint64_t index = (vaddr / sysconf(_SC_PAGE_SIZE)) * sizeof(uint64_t);
+    if (pread(fd, &paddr, sizeof(paddr), index) == sizeof(paddr)) {
+        // Check if the page is present
+        if (!(paddr & (1ULL << 63))) {
+            fprintf(stderr, "Page not present\n");
+            return 0;
+        }
+        paddr &= 0x7fffffffffffff;
+        paddr = paddr * sysconf(_SC_PAGE_SIZE) + (vaddr % sysconf(_SC_PAGE_SIZE));
     }
-    if (lseek(pagemap_fd, offset, SEEK_SET) == (off_t)-1) {
-        printf("lseek");
-        close(pagemap_fd);
-        return -1;
-    }
-    if (read(pagemap_fd, &physical_page_number, sizeof(uint64_t)) != sizeof(uint64_t)) {
-        printf("read");
-        close(pagemap_fd);
-        return -1;
-    }
-    close(pagemap_fd);
-    if (!(physical_page_number & (1ULL << 63))) {
-        printf("Page not present\n");
-        return -1;
-    }
-    physical_page_number &= ((1ULL << 54) - 1);
-    uint64_t physical_address = (physical_page_number * sysconf(_SC_PAGE_SIZE)) + ((uint64_t)virtual_address % sysconf(_SC_PAGE_SIZE));
-    return physical_address;
+    close(fd);
+    return paddr;
 }
 
 int mdev_dma_map_circq(octboot_net_device_t* mdev) {
@@ -881,9 +893,18 @@ int mdev_dma_map_circq(octboot_net_device_t* mdev) {
     }
     mdev->txq[0].iova_cons_idx = (void*)dma_map4.iova;
 #else
-    mdev->rxq[0].vaddr_cons_idx = mdev->hugepage_addr;
-    mdev->rxq[0].iova_cons_idx = (void*)get_physical_address(mdev->hugepage_addr);
-
+    mdev->rxq[0].vaddr_prod_idx = mdev->hugepage_addr;
+    mdev->rxq[0].iova_prod_idx = (void*)virt_to_phys((uint64_t)mdev->hugepage_addr);
+    mdev->rxq[0].vaddr_cons_idx = mdev->hugepage_addr + sizeof(uint64_t) * OCTBOOT_NET_MAXQ;
+    mdev->rxq[0].iova_cons_idx = (void*)virt_to_phys((uint64_t)mdev->hugepage_addr + sizeof(uint64_t) * OCTBOOT_NET_MAXQ);
+    mdev->txq[0].vaddr_prod_idx = mdev->hugepage_addr + sizeof(uint64_t) * OCTBOOT_NET_MAXQ * 2;
+    mdev->txq[0].iova_prod_idx = (void*)virt_to_phys((uint64_t)mdev->hugepage_addr + sizeof(uint64_t) * OCTBOOT_NET_MAXQ * 2);
+    mdev->txq[0].vaddr_cons_idx = mdev->hugepage_addr + sizeof(uint64_t) * OCTBOOT_NET_MAXQ * 3;
+    mdev->txq[0].iova_cons_idx = (void*)virt_to_phys((uint64_t)mdev->hugepage_addr + sizeof(uint64_t) * OCTBOOT_NET_MAXQ * 3);
+    printf("rxq[0].vaddr_prod_idx=%p, rxq[0].iova_prod_idx=%p\n", mdev->rxq[0].vaddr_prod_idx, mdev->rxq[0].iova_prod_idx);
+    printf("rxq[0].vaddr_cons_idx=%p, rxq[0].iova_cons_idx=%p\n", mdev->rxq[0].vaddr_cons_idx, mdev->rxq[0].iova_cons_idx);
+    printf("txq[0].vaddr_prod_idx=%p, txq[0].iova_prod_idx=%p\n", mdev->txq[0].vaddr_prod_idx, mdev->txq[0].iova_prod_idx);
+    printf("txq[0].vaddr_cons_idx=%p, txq[0].iova_cons_idx=%p\n", mdev->txq[0].vaddr_cons_idx, mdev->txq[0].iova_cons_idx);
 #endif
 
     return 0;
@@ -891,6 +912,7 @@ int mdev_dma_map_circq(octboot_net_device_t* mdev) {
 
 int mdev_dma_map_pktbuf(octboot_net_device_t* mdev) {
 
+#ifdef VFIO_ENABLED
     mdev->rxq[0].vaddr_pktbuf = mmap(NULL, OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct vfio_iommu_type1_dma_map dma_map1 = {
@@ -920,6 +942,14 @@ int mdev_dma_map_pktbuf(octboot_net_device_t* mdev) {
         return -1;
     }
     mdev->txq[0].iova_pktbuf = (void*)dma_map2.iova;
+#else
+    mdev->rxq[0].vaddr_pktbuf = mdev->hugepage_addr + HUGEPAGE_PKTBUF_OFFSET;
+    mdev->rxq[0].iova_pktbuf = (void*)virt_to_phys((uint64_t)mdev->hugepage_addr + HUGEPAGE_PKTBUF_OFFSET);
+    mdev->txq[0].vaddr_pktbuf = mdev->hugepage_addr + HUGEPAGE_PKTBUF_OFFSET + OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS;
+    mdev->txq[0].iova_pktbuf = (void*)virt_to_phys((uint64_t)mdev->hugepage_addr + HUGEPAGE_PKTBUF_OFFSET + OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS);
+    printf("rxq[0].vaddr_pktbuf=%p, rxq[0].iova_pktbuf=%p\n", mdev->rxq[0].vaddr_pktbuf, mdev->rxq[0].iova_pktbuf);
+    printf("txq[0].vaddr_pktbuf=%p, txq[0].iova_pktbuf=%p\n", mdev->txq[0].vaddr_pktbuf, mdev->txq[0].iova_pktbuf);
+#endif
     return 0;
 }
 
@@ -931,10 +961,10 @@ int mdev_setup_rx_ring(octboot_net_device_t* mdev) {
     rq->pkts = 0;
     rq->bytes = 0;
     rq->errors = 0;
-    rq->hw_descq = (uint8_t*)RX_DESCQ_OFFSET(mdev);
-    rq->hw_prod_idx = (uint32_t *)(rq->hw_descq +
+    rq->addr_hw_descq = (uint8_t*)RX_DESCQ_OFFSET(mdev);
+    rq->addr_hw_prod_idx = (uint32_t *)(rq->addr_hw_descq +
         offsetof(struct octboot_net_hw_descq, prod_idx));
-    rq->hw_cons_idx = (uint32_t *)(rq->hw_descq +
+    rq->addr_hw_cons_idx = (uint32_t *)(rq->addr_hw_descq +
         offsetof(struct octboot_net_hw_descq, cons_idx));
     *(uint32_t*)rq->vaddr_cons_idx = 0;
 
@@ -962,8 +992,9 @@ int mdev_setup_rx_ring(octboot_net_device_t* mdev) {
     rq->status = OCTBOOT_NET_DESCQ_READY;
 
     wmb();
-    mmio_memwrite(rq->hw_descq, descq, descq_tot_size);
+    mmio_memwrite(rq->addr_hw_descq, descq, descq_tot_size);
     free(descq);
+    printf("rxq setup done successfully\n");
     return 0;
 }
 
@@ -975,10 +1006,10 @@ int mdev_setup_tx_ring(octboot_net_device_t* mdev) {
     tq->pkts = 0;
     tq->bytes = 0;
     tq->errors = 0;
-    tq->hw_descq = (uint8_t*)TX_DESCQ_OFFSET(mdev);
-    tq->hw_prod_idx = (uint32_t *)(tq->hw_descq +
+    tq->addr_hw_descq = (uint8_t*)TX_DESCQ_OFFSET(mdev);
+    tq->addr_hw_prod_idx = (uint32_t *)(tq->addr_hw_descq +
         offsetof(struct octboot_net_hw_descq, prod_idx));
-    tq->hw_cons_idx = (uint32_t *)(tq->hw_descq +
+    tq->addr_hw_cons_idx = (uint32_t *)(tq->addr_hw_descq +
         offsetof(struct octboot_net_hw_descq, cons_idx));
     *(uint32_t*)tq->vaddr_cons_idx = 0;
 
@@ -1006,12 +1037,12 @@ int mdev_setup_tx_ring(octboot_net_device_t* mdev) {
     tq->status = OCTBOOT_NET_DESCQ_READY;
 
     wmb();
-    mmio_memwrite(tq->hw_descq, descq, descq_tot_size);
+    mmio_memwrite(tq->addr_hw_descq, descq, descq_tot_size);
     free(descq);
+    printf("txq setup done successfully\n");
     return 0;
 }
 
-#define HUGEPAGE_SIZE (1 * 1024 * 1024 * 1024) // 1 GiB
 int mdev_hugepage_alloc(octboot_net_device_t* mdev) {
     if (mdev == NULL) {
         printf("invalid parameter of mdev\n");
@@ -1032,6 +1063,12 @@ int mdev_hugepage_alloc(octboot_net_device_t* mdev) {
         return -1;
     }
     printf("hugepage_addr = %p\n", mdev->hugepage_addr);
+
+    // Touch the memory to ensure the page is present
+    void* addr = mdev->hugepage_addr;
+    for (size_t i = 0; i < HUGEPAGE_SIZE; i += sysconf(_SC_PAGE_SIZE)) {
+        *((volatile char *)addr + i) = 0;
+    }
 
     return 0;
 }
@@ -1238,7 +1275,7 @@ static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
     struct octboot_net_hw_desc_ptr ptr;
     ssize_t bytes_sent;
     for (int i = 0; i < count; i++) {
-        hw_desc_ptr = rq->hw_descq + OCTBOOT_NET_DESC_ARR_ENTRY_OFFSET(start);
+        hw_desc_ptr = rq->addr_hw_descq + OCTBOOT_NET_DESC_ARR_ENTRY_OFFSET(start);
         mmio_memread(&ptr, hw_desc_ptr, sizeof(struct octboot_net_hw_desc_ptr));
         if (unlikely(ptr.hdr.s_mgmt_net.total_len < ETH_ZLEN ||
             ptr.hdr.s_mgmt_net.total_len > OCTBOOT_NET_RX_BUF_SIZE ||
@@ -1277,6 +1314,8 @@ static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
         printf("hw_cons_idx=0x%x cons_idx=0x%x\n", hw_cons_idx, cons_idx);
         return;
 	}
+
+    printf("count=%d hw_cons_idx=0x%x cons_idx=0x%x\n", count, hw_cons_idx, cons_idx);
     count = octboot_net_circq_depth(hw_cons_idx,  cons_idx, rq->mask);
     if (count > 0) {
         octeon_handle_rxq(mdev, sock_fd);
@@ -1289,7 +1328,7 @@ void* octeon_thread_func(void* arg) {
         usleep(THREAD_SLEEP_US);
 
         pthread_mutex_lock(&controller.mutex);
-        while (controller.status == STATUS_SUSPENDED) {
+        while (controller.octeon_status == STATUS_SUSPENDED) {
             pthread_cond_wait(&controller.cond, &controller.mutex);
         }
 
@@ -1344,7 +1383,7 @@ static void veth_handle_rawsock(int sock_fd, octboot_net_device_t* mdev) {
         ptr.hdr.s_mgmt_net.ptr_len = recv_len;
         ptr.hdr.s_mgmt_net.ptr_type = OCTBOOT_NET_DESC_PTR_DIRECT;
         ptr.ptr = (uint64_t)((uint8_t*)tq->iova_pktbuf + (prod_idx * OCTBOOT_NET_RX_BUF_SIZE));
-        uint8_t* hw_desc_ptr = tq->hw_descq + OCTBOOT_NET_DESC_ARR_ENTRY_OFFSET(prod_idx);
+        uint8_t* hw_desc_ptr = tq->addr_hw_descq + OCTBOOT_NET_DESC_ARR_ENTRY_OFFSET(prod_idx);
         mmio_memwrite(hw_desc_ptr, &ptr, sizeof(struct octboot_net_hw_desc_ptr));
 
         wmb();
@@ -1355,7 +1394,7 @@ static void veth_handle_rawsock(int sock_fd, octboot_net_device_t* mdev) {
     }
 
 	wmb();
-    writel(tq->local_prod_idx, tq->hw_prod_idx);
+    writel(tq->local_prod_idx, tq->addr_hw_prod_idx);
 }
 
 void* veth_thread_func(void* arg) {
@@ -1364,7 +1403,7 @@ void* veth_thread_func(void* arg) {
         usleep(THREAD_SLEEP_US);
 
         pthread_mutex_lock(&controller.mutex);
-        while (controller.status == STATUS_SUSPENDED) {
+        while (controller.veth_status == STATUS_SUSPENDED) {
             pthread_cond_wait(&controller.cond, &controller.mutex);
         }
 
@@ -1756,15 +1795,10 @@ static int octeon_target_setup_2(octboot_net_device_t* mdev) {
     default:
         break;
     }
-#if 0
-    if ((OCTNET_TARGET_RUNNING != get_target_status(mdev)) 
-    || OCTNET_HOST_RUNNING != get_host_status(mdev))
-        return -1;
-#endif
 
-    if ((OCTNET_TARGET_READY != get_target_status(mdev)) 
-        || OCTNET_TARGET_READY != get_host_status(mdev)) {
-        printf("target status is not ready\n");
+    if ((OCTNET_TARGET_RUNNING != get_target_status(mdev)) 
+        || OCTNET_HOST_RUNNING != get_host_status(mdev)) {
+        printf("target status is not running\n");
         return -1;
     }
 
@@ -1835,7 +1869,7 @@ int main(int argc, char *argv[]) {
         printf("failed to init dma\n");
         return -1;
     }
-#if 0
+
     if (mdev_setup_rx_ring(&octbootdev[0]) < 0) {
         printf("failed to setup rx ring\n");
         mdev_clean_rx_ring(&octbootdev[0]);
@@ -1883,6 +1917,6 @@ int main(int argc, char *argv[]) {
 
     pthread_join(octeon_thread, NULL);
     pthread_join(veth_thread, NULL);
-#endif
+
     return ret;
 }

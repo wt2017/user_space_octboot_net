@@ -1260,7 +1260,8 @@ void dump_packet(const uint8_t* pktbuf, size_t N) {
         return;
     }
 
-    printf("Packet Dump (Length: %zu bytes):\n", N);
+    printf("Packet Dump Start (Length: %zu bytes):\n", N);
+    printf("Human readable format:\n");
     for (size_t i = 0; i < N; i++) {
         // Print the byte in hexadecimal format
         printf("%02X ", pktbuf[i]);
@@ -1275,6 +1276,14 @@ void dump_packet(const uint8_t* pktbuf, size_t N) {
     if (N % 16 != 0) {
         printf("\n");
     }
+
+    printf("Hex as input of .pcap translation:\n");
+    for (size_t i = 0; i < N; i++) {
+        // Print the byte in hexadecimal format
+        printf("%02X", pktbuf[i]);
+    }
+    printf("\n");
+    printf("Packet Dump End (Length: %zu bytes):\n", N);
 }
 
 static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {

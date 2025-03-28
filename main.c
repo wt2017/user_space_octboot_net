@@ -240,6 +240,7 @@ typedef struct {
 	int container_fd;
     int group_fd;
     int device_fd;
+    bool bar_mapped;
     struct uboot_pcinet_barmap npu_memmap_info;
     bool signature_found;
     int hugepage_fd;
@@ -775,6 +776,7 @@ int mdev_bar_map(octboot_net_device_t* mdev) {
             mdev_mm_uninit(mdev);
             return -1;
         }
+        mdev->bar_mapped = true;
         printf("bar%d bar_addr=%p\n", i*2, mdev->bar_map[i].bar_addr);
     }
 #else
@@ -1713,30 +1715,53 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
         return -1;
     }
 #endif
-
-
-#ifdef VFIO_ENABLED
-    if (vfio_read(mdev->device_fd, &host_version0,
-        sizeof(host_version0), HOST_VERSION_OFFSET_VAL(mdev))) {
-            printf("read fd[%d] host_version0[0x%lx] offset[0x%lx] error\n", mdev->device_fd, host_version0, HOST_VERSION_OFFSET_VAL(mdev));
-            return -1;
-        }
-    printf("read fd[%d] host_version0[0x%lx] offset[0x%lx]\n", mdev->device_fd, host_version0, HOST_VERSION_OFFSET_VAL(mdev));
-    if (vfio_write(mdev->device_fd, &host_version,
-            sizeof(host_version), HOST_VERSION_OFFSET_VAL(mdev))) {
-                printf("write fd[%d] host_version[0x%lx] offset[0x%lx] error\n", mdev->device_fd, host_version,HOST_VERSION_OFFSET_VAL(mdev));
-                return -1;
-            }
-    printf("write fd[%d] host_version[0x%lx] offset[0x%lx]\n", mdev->device_fd, host_version,HOST_VERSION_OFFSET_VAL(mdev));
-    if (vfio_read(mdev->device_fd, &host_version1,
-        sizeof(host_version1), HOST_VERSION_OFFSET_VAL(mdev))) {
-            printf("read fd[%d] host_version1[0x%lx] offset[0x%lx] error\n", mdev->device_fd, host_version1, HOST_VERSION_OFFSET_VAL(mdev));
-            return -1;
-        }
-    printf("read fd[%d] host_version1[0x%lx] offset[0x%lx]\n", mdev->device_fd, host_version1, HOST_VERSION_OFFSET_VAL(mdev));
-#else
     uint64_t host_version = ((OCTBOOT_NET_VERSION_MAJOR << 8)|OCTBOOT_NET_VERSION_MINOR);
     uint64_t host_version0, host_version1;
+
+#ifdef VFIO_ENABLED
+    if (mdev->bar_mapped) {
+        host_version0 = readq(HOST_VERSION_REG(mdev));
+        printf("read host_version0[0x%lx]\n", host_version0);
+        if (host_version0 != host_version) {
+            writeq(host_version, HOST_VERSION_REG(mdev));
+            printf("write host_version[0x%lx]\n", host_version);
+            host_version1 = readq(HOST_VERSION_REG(mdev));
+            printf("read host_version1[0x%lx]\n", host_version1);
+            if (host_version1 != host_version) {
+                printf("Failed to set host version\n");
+                return -1;
+            }
+        }
+
+        uint64_t target_version = get_target_version(mdev);
+        if ((host_version >> 8) != (target_version >> 8)) {
+            printf("octboot_net driver imcompatible with uboot, host_version:0x%lx, target_version:0x%lx\n",
+                host_version, target_version);
+            return -1;
+        }
+    } else {
+        if (vfio_read(mdev->device_fd, &host_version0,
+            sizeof(host_version0), HOST_VERSION_OFFSET_VAL(mdev))) {
+                printf("read fd[%d] host_version0[0x%lx] offset[0x%lx] error\n", mdev->device_fd, host_version0, HOST_VERSION_OFFSET_VAL(mdev));
+                return -1;
+            }
+        printf("read fd[%d] host_version0[0x%lx] offset[0x%lx]\n", mdev->device_fd, host_version0, HOST_VERSION_OFFSET_VAL(mdev));
+        if (vfio_write(mdev->device_fd, &host_version,
+                sizeof(host_version), HOST_VERSION_OFFSET_VAL(mdev))) {
+                    printf("write fd[%d] host_version[0x%lx] offset[0x%lx] error\n", mdev->device_fd, host_version,HOST_VERSION_OFFSET_VAL(mdev));
+                    return -1;
+                }
+        printf("write fd[%d] host_version[0x%lx] offset[0x%lx]\n", mdev->device_fd, host_version,HOST_VERSION_OFFSET_VAL(mdev));
+        if (vfio_read(mdev->device_fd, &host_version1,
+            sizeof(host_version1), HOST_VERSION_OFFSET_VAL(mdev))) {
+                printf("read fd[%d] host_version1[0x%lx] offset[0x%lx] error\n", mdev->device_fd, host_version1, HOST_VERSION_OFFSET_VAL(mdev));
+                return -1;
+            }
+        printf("read fd[%d] host_version1[0x%lx] offset[0x%lx]\n", mdev->device_fd, host_version1, HOST_VERSION_OFFSET_VAL(mdev));
+    }
+
+#else
+
     host_version0 = readq(HOST_VERSION_REG(mdev));
     if (host_version0 != host_version) {
         writeq(host_version, HOST_VERSION_REG(mdev));
@@ -1770,8 +1795,6 @@ static int octeon_target_setup(octboot_net_device_t* mdev) {
         return -1;
     }
 
-    change_host_status(mdev, OCTNET_HOST_READY, false);
-    usleep(1000);
 #endif
 
     return 0;
@@ -1812,6 +1835,7 @@ int main(int argc, char *argv[]) {
         octbootdev[i].container_fd = -1;
         octbootdev[i].group_fd = -1;
         octbootdev[i].device_fd = -1;
+        octbootdev[i].bar_mapped = false;
         for (int j = 0; j < NUM_BARS; j++) {
             octbootdev[i].bar_map[j].bar_addr = NULL;
             octbootdev[i].bar_map[j].bar_size = 0;
@@ -1855,10 +1879,6 @@ int main(int argc, char *argv[]) {
     }
     printf("octeon target comes up\n");
 
-    while (octeon_target_setup_2(&octbootdev[0]) < 0) {
-        usleep(INIT_SLEEP_US);
-    }
-
     if (mdev_hugepage_alloc(&octbootdev[0]) < 0) {
         printf("failed to allocate hugepage\n");
         return -1;
@@ -1883,6 +1903,11 @@ int main(int argc, char *argv[]) {
         mdev_clean_tx_ring(&octbootdev[0]);
         mdev_mm_uninit(&octbootdev[0]);
         return -1;
+    }
+
+    change_host_status(&octbootdev[0], OCTNET_HOST_READY, false);
+    while (octeon_target_setup_2(&octbootdev[0]) < 0) {
+        usleep(INIT_SLEEP_US);
     }
 
 #if 0

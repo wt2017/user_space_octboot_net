@@ -13,4 +13,5 @@ readlink /sys/bus/pci/devices/0000\:b3\:00.0/iommu_group | awk -F '/' '{print $N
 lspci -s 0000:b3:00.0 -vvv
 
 # Hex raw data of pkt
-echo -n "FF FF FF FF FF FF ... 63 82 53 63 FF" | xxd -r -p > mydata.bin
+echo -n "FFFFFFFFFFFF ... 63825363FF" | xxd -r -p > raw.bin
+python3 pcap_generator.py -i raw.bin -o pkt.pcap

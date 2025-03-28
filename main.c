@@ -1254,6 +1254,29 @@ int mdev_mm_init(octboot_net_device_t* mdev) {
     return 0;
 }
 
+void dump_packet(const uint8_t* pktbuf, size_t N) {
+    if (pktbuf == NULL || N == 0) {
+        printf("Invalid packet buffer or length.\n");
+        return;
+    }
+
+    printf("Packet Dump (Length: %zu bytes):\n", N);
+    for (size_t i = 0; i < N; i++) {
+        // Print the byte in hexadecimal format
+        printf("%02X ", pktbuf[i]);
+
+        // Add a newline every 16 bytes for readability
+        if ((i + 1) % 16 == 0) {
+            printf("\n");
+        }
+    }
+
+    // Add a final newline if the last line wasn't complete
+    if (N % 16 != 0) {
+        printf("\n");
+    }
+}
+
 static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
     struct octboot_net_sw_descq* rq = &mdev->rxq[0];
     if (rq->status != OCTBOOT_NET_DESCQ_READY) {
@@ -1294,12 +1317,15 @@ static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
                 printf("ptr.ptr != pktbuf in rxq\n");
                 return;
             }
+            dump_packet((uint8_t*)rq->vaddr_pktbuf + (start * OCTBOOT_NET_RX_BUF_SIZE), ptr.hdr.s_mgmt_net.total_len);
+#if 0
             bytes_sent = send(sock_fd, (uint8_t*)rq->vaddr_pktbuf + (start * OCTBOOT_NET_RX_BUF_SIZE),
                 ptr.hdr.s_mgmt_net.total_len, 0);
             if (bytes_sent != ptr.hdr.s_mgmt_net.total_len) {
                 printf("Partial send: %zd of %u bytes\n", bytes_sent, ptr.hdr.s_mgmt_net.total_len);
                 return;
             }
+#endif
         }
         start = octboot_net_circq_inc(start, rq->mask);
     }

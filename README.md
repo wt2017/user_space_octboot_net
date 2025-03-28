@@ -11,3 +11,6 @@ readlink /sys/bus/pci/devices/0000\:b3\:00.0/iommu_group | awk -F '/' '{print $N
 
 # Get memory regions in PCI
 lspci -s 0000:b3:00.0 -vvv
+
+# Hex raw data of pkt
+echo -n "FF FF FF FF FF FF ... 63 82 53 63 FF" | xxd -r -p > mydata.bin

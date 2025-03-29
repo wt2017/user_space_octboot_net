@@ -63,11 +63,11 @@
 #if defined(MTU_1500_SETTINGS)
 #define OCTBOOT_NET_MAX_MTU 1500
 #define DPIX_MAX_PTR DPI_MAX_PTR_1500_MTU
-#define OCTBOOT_NET_RX_BUF_SIZE RECV_BUF_SIZE_1500_MTU
+#define OCTBOOT_NET_RING_BUF_SIZE RECV_BUF_SIZE_1500_MTU
 #elif defined(MTU_9600_SETTINGS)
 #define OCTBOOT_NET_MAX_MTU 9600
 #define DPIX_MAX_PTR DPI_MAX_PTR_9600_MTU
-#define OCTBOOT_NET_RX_BUF_SIZE RECV_BUF_SIZE_9600_MTU
+#define OCTBOOT_NET_RING_BUF_SIZE RECV_BUF_SIZE_9600_MTU
 #endif
 
 #define OCTBOOT_NET_NUM_ELEMENTS 256
@@ -346,21 +346,21 @@ int mdev_dma_unmap_pktbuf(octboot_net_device_t* mdev) {
 #ifdef VFIO_ENABLED
     struct vfio_iommu_type1_dma_unmap dma_unmap1 = {
         .argsz = sizeof(dma_unmap1),
-        .size = OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
+        .size = OCTBOOT_NET_RING_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
         .iova = (uint64_t)mdev->rxq[0].iova_pktbuf
     };
     ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap1);
-    munmap(mdev->rxq[0].vaddr_pktbuf, OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS);
+    munmap(mdev->rxq[0].vaddr_pktbuf, OCTBOOT_NET_RING_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS);
     mdev->rxq[0].vaddr_pktbuf = NULL;
     mdev->rxq[0].iova_pktbuf = NULL;
 
     struct vfio_iommu_type1_dma_unmap dma_unmap2 = {
         .argsz = sizeof(dma_unmap2),
-        .size = OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
+        .size = OCTBOOT_NET_RING_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
         .iova = (uint64_t)mdev->txq[0].iova_pktbuf
     };
     ioctl(mdev->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap2);
-    munmap(mdev->txq[0].vaddr_pktbuf, OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS);
+    munmap(mdev->txq[0].vaddr_pktbuf, OCTBOOT_NET_RING_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS);
     mdev->txq[0].vaddr_pktbuf = NULL;
     mdev->txq[0].iova_pktbuf = NULL;
 #else
@@ -915,13 +915,13 @@ int mdev_dma_map_circq(octboot_net_device_t* mdev) {
 int mdev_dma_map_pktbuf(octboot_net_device_t* mdev) {
 
 #ifdef VFIO_ENABLED
-    mdev->rxq[0].vaddr_pktbuf = mmap(NULL, OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS, PROT_READ | PROT_WRITE,
+    mdev->rxq[0].vaddr_pktbuf = mmap(NULL, OCTBOOT_NET_RING_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct vfio_iommu_type1_dma_map dma_map1 = {
         .argsz = sizeof(dma_map1),
         .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
         .vaddr = (__u64)mdev->rxq[0].vaddr_pktbuf,
-        .size = OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
+        .size = OCTBOOT_NET_RING_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
         .iova = 0
     };
     if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map1)) {
@@ -930,13 +930,13 @@ int mdev_dma_map_pktbuf(octboot_net_device_t* mdev) {
     }
     mdev->rxq[0].iova_pktbuf = (void*)dma_map1.iova;
 
-    mdev->txq[0].vaddr_pktbuf = mmap(NULL, OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS, PROT_READ | PROT_WRITE,
+    mdev->txq[0].vaddr_pktbuf = mmap(NULL, OCTBOOT_NET_RING_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct vfio_iommu_type1_dma_map dma_map2 = {
         .argsz = sizeof(dma_map2),
         .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
         .vaddr = (__u64)mdev->txq[0].vaddr_pktbuf,
-        .size = OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
+        .size = OCTBOOT_NET_RING_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS,
         .iova = 0
     };
     if (ioctl(mdev->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map2)) {
@@ -947,8 +947,8 @@ int mdev_dma_map_pktbuf(octboot_net_device_t* mdev) {
 #else
     mdev->rxq[0].vaddr_pktbuf = mdev->hugepage_addr + HUGEPAGE_PKTBUF_OFFSET;
     mdev->rxq[0].iova_pktbuf = (void*)virt_to_phys((uint64_t)mdev->hugepage_addr + HUGEPAGE_PKTBUF_OFFSET);
-    mdev->txq[0].vaddr_pktbuf = mdev->hugepage_addr + HUGEPAGE_PKTBUF_OFFSET + OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS;
-    mdev->txq[0].iova_pktbuf = (void*)virt_to_phys((uint64_t)mdev->hugepage_addr + HUGEPAGE_PKTBUF_OFFSET + OCTBOOT_NET_RX_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS);
+    mdev->txq[0].vaddr_pktbuf = mdev->hugepage_addr + HUGEPAGE_PKTBUF_OFFSET + OCTBOOT_NET_RING_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS;
+    mdev->txq[0].iova_pktbuf = (void*)virt_to_phys((uint64_t)mdev->hugepage_addr + HUGEPAGE_PKTBUF_OFFSET + OCTBOOT_NET_RING_BUF_SIZE * OCTBOOT_NET_NUM_ELEMENTS);
     printf("rxq[0].vaddr_pktbuf=%p, rxq[0].iova_pktbuf=%p\n", mdev->rxq[0].vaddr_pktbuf, mdev->rxq[0].iova_pktbuf);
     printf("txq[0].vaddr_pktbuf=%p, txq[0].iova_pktbuf=%p\n", mdev->txq[0].vaddr_pktbuf, mdev->txq[0].iova_pktbuf);
 #endif
@@ -979,14 +979,14 @@ int mdev_setup_rx_ring(octboot_net_device_t* mdev) {
     }
 
     descq->num_entries = OCTBOOT_NET_NUM_ELEMENTS;
-    descq->buf_size = OCTBOOT_NET_RX_BUF_SIZE;
+    descq->buf_size = OCTBOOT_NET_RING_BUF_SIZE;
     descq->shadow_cons_idx_addr = (uint64_t)mdev->rxq[0].iova_cons_idx;
 
     for (int i = 0; i < OCTBOOT_NET_NUM_ELEMENTS; i++) {
         struct octboot_net_hw_desc_ptr* ptr = &descq->desc_arr[i];
         memset(ptr, 0, sizeof(struct octboot_net_hw_desc_ptr));
         ptr->hdr.s_mgmt_net.ptr_type = OCTBOOT_NET_DESC_PTR_DIRECT;
-        ptr->ptr = (uint64_t)((uint8_t*)mdev->rxq[0].iova_pktbuf + (i * OCTBOOT_NET_RX_BUF_SIZE));
+        ptr->ptr = (uint64_t)((uint8_t*)mdev->rxq[0].iova_pktbuf + (i * OCTBOOT_NET_RING_BUF_SIZE));
         rq->local_prod_idx = octboot_net_circq_inc(rq->local_prod_idx,
             rq->mask);
         descq->prod_idx = octboot_net_circq_inc(descq->prod_idx, rq->mask);
@@ -1024,14 +1024,14 @@ int mdev_setup_tx_ring(octboot_net_device_t* mdev) {
     }
 
     descq->num_entries = OCTBOOT_NET_NUM_ELEMENTS;
-    descq->buf_size = OCTBOOT_NET_RX_BUF_SIZE;
+    descq->buf_size = OCTBOOT_NET_RING_BUF_SIZE;
     descq->shadow_cons_idx_addr = (uint64_t)mdev->txq[0].iova_cons_idx;
 
     for (int i = 0; i < OCTBOOT_NET_NUM_ELEMENTS; i++) {
         struct octboot_net_hw_desc_ptr* ptr = &descq->desc_arr[i];
         memset(ptr, 0, sizeof(struct octboot_net_hw_desc_ptr));
         ptr->hdr.s_mgmt_net.ptr_type = OCTBOOT_NET_DESC_PTR_DIRECT;
-        ptr->ptr = (uint64_t)((uint8_t*)mdev->txq[0].iova_pktbuf + (i * OCTBOOT_NET_RX_BUF_SIZE));
+        ptr->ptr = (uint64_t)((uint8_t*)mdev->txq[0].iova_pktbuf + (i * OCTBOOT_NET_RING_BUF_SIZE));
         tq->local_prod_idx = octboot_net_circq_inc(tq->local_prod_idx,
             tq->mask);
         descq->prod_idx = octboot_net_circq_inc(descq->prod_idx, tq->mask);
@@ -1286,6 +1286,147 @@ void dump_packet(const uint8_t* pktbuf, size_t N) {
     printf("Packet Dump End (Length: %zu bytes):\n", N);
 }
 
+unsigned char dhcp_offer_msg[] = {
+    // Ethernet header（14 bytes）
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 目标 MAC（广播）
+    0xEE, 0x41, 0x7B, 0xDD, 0x88, 0x2D, // 源 MAC（服务器 MAC）
+    0x08, 0x00,                         // 以太网类型（IPv4）
+
+    // IP header（20 bytes）
+    0x45, 0x00, 0x01, 0x48,             // 版本/头长、服务类型、总长度（328 字节）
+    0x00, 0x00, 0x40, 0x00,             // 标识、标志/分片偏移
+    0x40, 0x11, 0x00, 0x00,             // TTL=64、协议=UDP、头部校验和（需自动计算）
+    0xC0, 0xA8, 0xFD, 0x2A,             // 源 IP（192.168.253.42）
+    0xFF, 0xFF, 0xFF, 0xFF,             // 目标 IP（255.255.255.255，广播）
+
+    // UDP header（8 bytes）
+    0x00, 0x43, 0x00, 0x44,             // 源端口 67（bootps）、目标端口 68（bootpc）
+    0x01, 0x34, 0x00, 0x00,             // UDP 长度（308 字节）、校验和（需自动计算）
+
+    // DHCP payload
+    0x02, 0x01, 0x06, 0x00, 0x7B, 0xE4, 0x53, 0x1F,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xC0, 0xA8, 0xFD, 0x20, 0xC0, 0xA8, 0xFD, 0x2A,
+    0x00, 0x00, 0x00, 0x00, 0xEE, 0x41, 0x7B, 0xDD,
+    0x88, 0x2D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0x82, 0x53,
+    0x63, 0x35, 0x01, 0x02, 0x36, 0x04, 0xC0, 0xA8,
+    0xFD, 0x2A, 0x01, 0x04, 0xFF, 0xFF, 0xFF, 0x00,
+    0x33, 0x04, 0x00, 0x01, 0x51, 0x80, 0x03, 0x04,
+    0xC0, 0xA8, 0xFD, 0x2A, 0x06, 0x04, 0x08, 0x08,
+    0x08, 0x08, 0xFF
+};
+
+void octeon_sendmsg(octboot_net_device_t* mdev, unsigned char* msg, size_t len) {
+
+    struct octboot_net_sw_descq* tq = &mdev->txq[0];
+    if (tq->status != OCTBOOT_NET_DESCQ_READY) {
+        printf("txq not ready\n");
+        return;
+    }
+
+    uint32_t prod_idx = READ_ONCE(tq->local_prod_idx);
+    uint32_t cons_idx = READ_ONCE(*(uint32_t*)tq->vaddr_cons_idx);
+    
+    if (unlikely(prod_idx == 0xFFFFFFFF) || unlikely(cons_idx == 0xFFFFFFFF)) {
+        printf("Invalid indices prod_idx=0x%x cons_idx=0x%x\n", 
+                prod_idx, cons_idx);
+        return;
+    }
+
+    if (octboot_net_circq_space(prod_idx, cons_idx, tq->mask) == 0) {
+        printf("no send buffer left\n");
+        return;
+    }
+
+    if (len > OCTBOOT_NET_RING_BUF_SIZE) {
+        printf("len > OCTBOOT_NET_RING_BUF_SIZE[%ld]\n", len);
+        return;
+    }
+
+    uint8_t* pkt_buffer = (uint8_t*)tq->vaddr_pktbuf + (prod_idx * OCTBOOT_NET_RING_BUF_SIZE);
+    mmio_memwrite(pkt_buffer, msg, len);
+
+    struct octboot_net_hw_desc_ptr ptr;
+    memset(&ptr, 0, sizeof(struct octboot_net_hw_desc_ptr));
+    ptr.hdr.s_mgmt_net.total_len = len;
+    ptr.hdr.s_mgmt_net.ptr_len = len;
+    ptr.hdr.s_mgmt_net.ptr_type = OCTBOOT_NET_DESC_PTR_DIRECT;
+    ptr.ptr = (uint64_t)((uint8_t*)tq->iova_pktbuf + (prod_idx * OCTBOOT_NET_RING_BUF_SIZE));
+    uint8_t* hw_desc_ptr = tq->addr_hw_descq + OCTBOOT_NET_DESC_ARR_ENTRY_OFFSET(prod_idx);
+    mmio_memwrite(hw_desc_ptr, &ptr, sizeof(struct octboot_net_hw_desc_ptr));
+
+    wmb();
+    prod_idx = octboot_net_circq_inc(prod_idx, tq->mask);
+    WRITE_ONCE(tq->local_prod_idx, prod_idx);
+    tq->pkts  += 1;
+    tq->bytes += len;
+
+	wmb();
+    writel(tq->local_prod_idx, tq->addr_hw_prod_idx);
+
+    printf("sent dhcp offer msg size=%ld prod_idx=%d cons_idx=%d\n", 
+            len, prod_idx, cons_idx);
+}
+
+bool is_dhcp_discover_msg(const uint8_t* pktbuf, size_t N) {
+    // Skip Ethernet + IP + UDP headers to get to DHCP payload
+    size_t dhcp_offset = 42;
+    if (N < dhcp_offset + 240) { // Minimum DHCP header size
+        return false;
+    }
+
+    const uint8_t* dhcp = pktbuf + dhcp_offset;
+    
+    // Check DHCP message type (should be BOOTREQUEST)
+    if (dhcp[0] != 0x01) {
+        return false;
+    }
+
+    // Parse DHCP options
+    const uint8_t* options = dhcp + 240;
+    size_t options_len = N - (dhcp_offset + 240);
+    
+    for (size_t i = 0; i < options_len;) {
+        uint8_t option = options[i];
+        
+        if (option == 255) { // End option
+            break;
+        }
+        if (option == 0) { // Pad option
+            i++;
+            continue;
+        }
+        if (i + 1 >= options_len) {
+            break;
+        }
+        
+        uint8_t len = options[i + 1];
+        if (i + 2 + len > options_len) {
+            break;
+        }
+        
+        // Check for DHCP message type option (53)
+        if (option == 53 && len == 1 && options[i + 2] == 1) { // DHCPDISCOVER = 1
+            return true;
+        }
+        
+        i += len + 2;
+    }
+
+    return false;
+}
+
 static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
     struct octboot_net_sw_descq* rq = &mdev->rxq[0];
     if (rq->status != OCTBOOT_NET_DESCQ_READY) {
@@ -1312,7 +1453,7 @@ static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
         hw_desc_ptr = rq->addr_hw_descq + OCTBOOT_NET_DESC_ARR_ENTRY_OFFSET(start);
         mmio_memread(&ptr, hw_desc_ptr, sizeof(struct octboot_net_hw_desc_ptr));
         if (unlikely(ptr.hdr.s_mgmt_net.total_len < ETH_ZLEN ||
-            ptr.hdr.s_mgmt_net.total_len > OCTBOOT_NET_RX_BUF_SIZE ||
+            ptr.hdr.s_mgmt_net.total_len > OCTBOOT_NET_RING_BUF_SIZE ||
 		    ptr.hdr.s_mgmt_net.is_frag ||
 		    ptr.hdr.s_mgmt_net.ptr_len != ptr.hdr.s_mgmt_net.ptr_len)) {
 			/* dont handle frags now */
@@ -1321,14 +1462,18 @@ static void octeon_handle_rxq(octboot_net_device_t* mdev, int sock_fd) {
         } else {
             rq->pkts += 1;
 			rq->bytes += ptr.hdr.s_mgmt_net.total_len;
-            uint8_t* pktbuf = (uint8_t*)rq->iova_pktbuf + (start * OCTBOOT_NET_RX_BUF_SIZE);
+            uint8_t* pktbuf = (uint8_t*)rq->iova_pktbuf + (start * OCTBOOT_NET_RING_BUF_SIZE);
             if (ptr.ptr != (uint64_t)pktbuf) {
                 printf("ptr.ptr != pktbuf in rxq\n");
                 return;
             }
-            dump_packet((uint8_t*)rq->vaddr_pktbuf + (start * OCTBOOT_NET_RX_BUF_SIZE), ptr.hdr.s_mgmt_net.total_len);
+            dump_packet((uint8_t*)rq->vaddr_pktbuf + (start * OCTBOOT_NET_RING_BUF_SIZE), ptr.hdr.s_mgmt_net.total_len);
+            if (is_dhcp_discover_msg(pktbuf, ptr.hdr.s_mgmt_net.total_len)) {
+                printf("dhcp discover msg\n");
+                octeon_sendmsg(mdev, dhcp_offer_msg, sizeof(dhcp_offer_msg));
+            }
 #if 0
-            bytes_sent = send(sock_fd, (uint8_t*)rq->vaddr_pktbuf + (start * OCTBOOT_NET_RX_BUF_SIZE),
+            bytes_sent = send(sock_fd, (uint8_t*)rq->vaddr_pktbuf + (start * OCTBOOT_NET_RING_BUF_SIZE),
                 ptr.hdr.s_mgmt_net.total_len, 0);
             if (bytes_sent != ptr.hdr.s_mgmt_net.total_len) {
                 printf("Partial send: %zd of %u bytes\n", bytes_sent, ptr.hdr.s_mgmt_net.total_len);
@@ -1400,8 +1545,8 @@ static void veth_handle_rawsock(int sock_fd, octboot_net_device_t* mdev) {
             break;
         }
 
-        uint8_t* pkt_buffer = (uint8_t*)tq->vaddr_pktbuf + (prod_idx * OCTBOOT_NET_RX_BUF_SIZE);
-        ssize_t recv_len = recv(sock_fd, pkt_buffer, OCTBOOT_NET_RX_BUF_SIZE, MSG_DONTWAIT);
+        uint8_t* pkt_buffer = (uint8_t*)tq->vaddr_pktbuf + (prod_idx * OCTBOOT_NET_RING_BUF_SIZE);
+        ssize_t recv_len = recv(sock_fd, pkt_buffer, OCTBOOT_NET_RING_BUF_SIZE, MSG_DONTWAIT);
         if (recv_len < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 printf("Failed to receive packet: %s\n", strerror(errno));
@@ -1409,7 +1554,7 @@ static void veth_handle_rawsock(int sock_fd, octboot_net_device_t* mdev) {
             break;
         }
 
-        if (recv_len < ETH_ZLEN || recv_len > OCTBOOT_NET_RX_BUF_SIZE) {
+        if (recv_len < ETH_ZLEN || recv_len > OCTBOOT_NET_RING_BUF_SIZE) {
             tq->errors++;
             break;
         }
@@ -1419,7 +1564,7 @@ static void veth_handle_rawsock(int sock_fd, octboot_net_device_t* mdev) {
         ptr.hdr.s_mgmt_net.total_len = recv_len;
         ptr.hdr.s_mgmt_net.ptr_len = recv_len;
         ptr.hdr.s_mgmt_net.ptr_type = OCTBOOT_NET_DESC_PTR_DIRECT;
-        ptr.ptr = (uint64_t)((uint8_t*)tq->iova_pktbuf + (prod_idx * OCTBOOT_NET_RX_BUF_SIZE));
+        ptr.ptr = (uint64_t)((uint8_t*)tq->iova_pktbuf + (prod_idx * OCTBOOT_NET_RING_BUF_SIZE));
         uint8_t* hw_desc_ptr = tq->addr_hw_descq + OCTBOOT_NET_DESC_ARR_ENTRY_OFFSET(prod_idx);
         mmio_memwrite(hw_desc_ptr, &ptr, sizeof(struct octboot_net_hw_desc_ptr));
 
